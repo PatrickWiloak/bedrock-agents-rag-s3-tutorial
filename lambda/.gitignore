@@ -1,0 +1,2 @@
+# Lambda TypeScript sources (we deploy compiled .js files)
+lambda/*.ts

@@ -1,0 +1,50 @@
+{
+  "name": "bedrock-agents-rag-s3-tutorial",
+  "version": "1.0.0",
+  "description": "Learn to build RAG systems with Amazon Bedrock Agents and S3",
+  "private": true,
+  "workspaces": [
+    "web"
+  ],
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc",
+    "build:web": "npm run build --workspace=web",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "upload-docs": "ts-node scripts/upload-documents.ts",
+    "test-agent": "ts-node scripts/test-agent.ts",
+    "check-status": "ts-node scripts/check-status.ts"
+  },
+  "keywords": [
+    "aws",
+    "bedrock",
+    "rag",
+    "agents",
+    "cdk",
+    "tutorial"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "aws-cdk": "^2.120.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-agent": "^3.470.0",
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.470.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.470.0",
+    "@aws-sdk/client-cloudformation": "^3.913.0",
+    "@aws-sdk/client-s3": "^3.470.0",
+    "@cdklabs/generative-ai-cdk-constructs": "^0.1.311",
+    "aws-cdk-lib": "^2.120.0",
+    "cdk-s3-vectors": "^0.2.2",
+    "constructs": "^10.3.0"
+  }
+}

@@ -1,0 +1,120 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BedrockAgentManagement",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:CreateAgent",
+        "bedrock:DeleteAgent",
+        "bedrock:GetAgent",
+        "bedrock:UpdateAgent",
+        "bedrock:ListAgents",
+        "bedrock:PrepareAgent",
+        "bedrock:CreateAgentAlias",
+        "bedrock:DeleteAgentAlias",
+        "bedrock:GetAgentAlias",
+        "bedrock:UpdateAgentAlias",
+        "bedrock:ListAgentAliases"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BedrockKnowledgeBaseManagement",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:CreateKnowledgeBase",
+        "bedrock:DeleteKnowledgeBase",
+        "bedrock:GetKnowledgeBase",
+        "bedrock:UpdateKnowledgeBase",
+        "bedrock:ListKnowledgeBases",
+        "bedrock:AssociateAgentKnowledgeBase",
+        "bedrock:DisassociateAgentKnowledgeBase",
+        "bedrock:GetAgentKnowledgeBase",
+        "bedrock:ListAgentKnowledgeBases",
+        "bedrock:UpdateAgentKnowledgeBase"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BedrockDataSourceManagement",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:CreateDataSource",
+        "bedrock:DeleteDataSource",
+        "bedrock:GetDataSource",
+        "bedrock:UpdateDataSource",
+        "bedrock:ListDataSources",
+        "bedrock:StartIngestionJob",
+        "bedrock:GetIngestionJob",
+        "bedrock:ListIngestionJobs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BedrockModelAndRuntimeAccess",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeAgent",
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream",
+        "bedrock:Retrieve",
+        "bedrock:RetrieveAndGenerate",
+        "bedrock:ListFoundationModels",
+        "bedrock:GetFoundationModel"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3VectorsManagement",
+      "Effect": "Allow",
+      "Action": [
+        "s3vectors:CreateVectorBucket",
+        "s3vectors:DeleteVectorBucket",
+        "s3vectors:GetVectorBucket",
+        "s3vectors:ListVectorBuckets",
+        "s3vectors:CreateIndex",
+        "s3vectors:DeleteIndex",
+        "s3vectors:GetIndex",
+        "s3vectors:ListVectorIndexes",
+        "s3vectors:ListVectorBucketIndexes"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IAMPassRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": [
+            "bedrock.amazonaws.com"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "S3BucketManagement",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:PutBucketPolicy",
+        "s3:DeleteBucketPolicy",
+        "s3:GetBucketPolicy",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject",
+        "s3:ListBucket",
+        "s3:PutBucketVersioning",
+        "s3:GetBucketVersioning",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:GetBucketPublicAccessBlock"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Compiled output
+dist/
+
+# Workspace lockfiles (only root package-lock.json should exist)
+web/package-lock.json
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+
+# AWS
+.aws-sam
+deployment-outputs.json
+deployment-outputs.txt
+
+# Temporary/WIP files
+*-new.sh
+*-old.sh
+*-backup.*
