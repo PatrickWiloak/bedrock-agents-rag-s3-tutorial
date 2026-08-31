@@ -1,24 +1,7 @@
 {
+  "Comment": "Bedrock- and S3 Vectors-specific permissions needed to deploy this tutorial. These sit on top of the permissions CDK already needs (CloudFormation, Lambda, API Gateway, CloudFront, IAM role creation), which the CDK bootstrap roles normally provide. Resource is '*' because the resources do not exist until the stack creates them; scope these down for anything beyond a tutorial.",
   "Version": "2012-10-17",
   "Statement": [
-    {
-      "Sid": "BedrockAgentManagement",
-      "Effect": "Allow",
-      "Action": [
-        "bedrock:CreateAgent",
-        "bedrock:DeleteAgent",
-        "bedrock:GetAgent",
-        "bedrock:UpdateAgent",
-        "bedrock:ListAgents",
-        "bedrock:PrepareAgent",
-        "bedrock:CreateAgentAlias",
-        "bedrock:DeleteAgentAlias",
-        "bedrock:GetAgentAlias",
-        "bedrock:UpdateAgentAlias",
-        "bedrock:ListAgentAliases"
-      ],
-      "Resource": "*"
-    },
     {
       "Sid": "BedrockKnowledgeBaseManagement",
       "Effect": "Allow",
@@ -28,11 +11,9 @@
         "bedrock:GetKnowledgeBase",
         "bedrock:UpdateKnowledgeBase",
         "bedrock:ListKnowledgeBases",
-        "bedrock:AssociateAgentKnowledgeBase",
-        "bedrock:DisassociateAgentKnowledgeBase",
-        "bedrock:GetAgentKnowledgeBase",
-        "bedrock:ListAgentKnowledgeBases",
-        "bedrock:UpdateAgentKnowledgeBase"
+        "bedrock:TagResource",
+        "bedrock:UntagResource",
+        "bedrock:ListTagsForResource"
       ],
       "Resource": "*"
     },
@@ -55,13 +36,14 @@
       "Sid": "BedrockModelAndRuntimeAccess",
       "Effect": "Allow",
       "Action": [
-        "bedrock:InvokeAgent",
         "bedrock:InvokeModel",
         "bedrock:InvokeModelWithResponseStream",
         "bedrock:Retrieve",
         "bedrock:RetrieveAndGenerate",
         "bedrock:ListFoundationModels",
-        "bedrock:GetFoundationModel"
+        "bedrock:GetFoundationModel",
+        "bedrock:ListInferenceProfiles",
+        "bedrock:GetInferenceProfile"
       ],
       "Resource": "*"
     },
@@ -73,26 +55,27 @@
         "s3vectors:DeleteVectorBucket",
         "s3vectors:GetVectorBucket",
         "s3vectors:ListVectorBuckets",
+        "s3vectors:GetVectorBucketPolicy",
+        "s3vectors:PutVectorBucketPolicy",
+        "s3vectors:DeleteVectorBucketPolicy",
         "s3vectors:CreateIndex",
         "s3vectors:DeleteIndex",
         "s3vectors:GetIndex",
-        "s3vectors:ListVectorIndexes",
-        "s3vectors:ListVectorBucketIndexes"
+        "s3vectors:ListIndexes",
+        "s3vectors:TagResource",
+        "s3vectors:UntagResource",
+        "s3vectors:ListTagsForResource"
       ],
       "Resource": "*"
     },
     {
-      "Sid": "IAMPassRole",
+      "Sid": "IAMPassRoleToBedrock",
       "Effect": "Allow",
-      "Action": [
-        "iam:PassRole"
-      ],
+      "Action": ["iam:PassRole"],
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "iam:PassedToService": [
-            "bedrock.amazonaws.com"
-          ]
+          "iam:PassedToService": ["bedrock.amazonaws.com"]
         }
       }
     },
@@ -111,6 +94,7 @@
         "s3:ListBucket",
         "s3:PutBucketVersioning",
         "s3:GetBucketVersioning",
+        "s3:PutEncryptionConfiguration",
         "s3:PutBucketPublicAccessBlock",
         "s3:GetBucketPublicAccessBlock"
       ],

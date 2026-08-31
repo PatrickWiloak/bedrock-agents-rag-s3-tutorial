@@ -1,439 +1,180 @@
-# RAG Agent Web UI
+# RAG Chat Web UI
 
-A beautiful chat interface for your Amazon Bedrock RAG agent built with Next.js and Tailwind CSS.
+The Next.js front end for the [Bedrock RAG tutorial](../README.md). A chat interface over a Bedrock Knowledge Base, with markdown rendering, dark mode, and citations.
+
+For the full explanation of how it fits together, see [docs/07-web-interface.md](../docs/07-web-interface.md).
 
 ## Features
 
-- **Agent Responses** - Get responses from your Bedrock Agent using the Agents API
-- **Beautiful UI** - Modern, responsive design with dark mode support
-- **Citations** - Displays source documents used for each response
-- **Session Management** - Maintains conversation context across multiple queries
-- **Sample Questions** - Quick-start buttons for common queries
-- **Markdown Support** - Renders formatted responses with code blocks, lists, etc.
+- Chat interface with markdown rendering and syntax highlighting
+- Source citations linking back to the S3 documents that grounded each answer
+- Multi-turn conversations via Bedrock-issued session IDs
+- Dark mode
+- Responsive layout
+- **Fully static** - no server side, no secrets in the browser
+
+## How it works
+
+This is a **static export** (`output: 'export'` in [next.config.ts](next.config.ts)). There are no Next.js route handlers and no server runtime. CDK uploads the built output to S3 and serves it through CloudFront.
+
+```
+Browser
+  │ 1. GET /              ──► CloudFront ──► S3 (Origin Access Control)
+  │ 2. GET /config.json   ──► CloudFront ──► S3
+  │ 3. POST {apiEndpoint}/chat ──► API Gateway ──► Lambda ──► Bedrock
+```
+
+The API Gateway URL doesn't exist until the stack deploys, so it can't be baked into the build. Instead CDK writes a `config.json` next to the site at deploy time, and the browser reads it at runtime.
+
+All AWS credentials live in the Lambda's IAM role. Nothing sensitive reaches the browser.
 
 ## Prerequisites
 
-1. **Deployed RAG Stack** - You must have deployed the CDK stack first:
-   ```bash
-   cd ..
-   cdk deploy
-   ```
+- Node.js 20+
+- The CDK stack deployed (see the [root README](../README.md)) if you want a working backend
 
-2. **AWS Credentials** - Configure AWS credentials locally:
-   ```bash
-   aws configure
-   # or use AWS_PROFILE environment variable
-   ```
+## Quick start
 
-3. **Stack Outputs** - Get your Agent ID and Alias ID from deployment outputs
+### Build and deploy
 
-## Quick Start
-
-### 1. Install Dependencies
+From the repository root:
 
 ```bash
-cd web
 npm install
+npm run build:web     # produces web/out
+cdk deploy            # uploads web/out and writes config.json
 ```
 
-### 2. Configure Environment
+**Build before deploying.** `cdk deploy` fails at synthesis if `web/out` doesn't exist.
 
-Copy the example environment file and fill in your values:
+Get your URL:
 
 ```bash
-cp .env.example .env
+aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`WebsiteURL`].OutputValue' --output text
 ```
 
-Edit `.env`:
-```env
-AWS_REGION=us-east-1
-AGENT_ID=YOUR_AGENT_ID_HERE
-AGENT_ALIAS_ID=YOUR_ALIAS_ID_HERE
-```
-
-**Getting Agent IDs:**
-
-From CDK deployment outputs:
-```bash
-# In the root directory
-aws cloudformation describe-stacks \
-  --stack-name S3VectorRAGStack \
-  --query 'Stacks[0].Outputs' \
-  --output table
-```
-
-Or check the deployment output after running `cdk deploy`.
-
-### 3. Run Development Server
+### Local development
 
 ```bash
-npm run dev
+npm run dev --workspace=web     # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+The dev server has no `config.json`, so sending a message shows "Application not deployed". To develop against your deployed backend, create one:
 
-## Project Structure
+```bash
+mkdir -p web/public
+API=$(aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' --output text)
+echo "{\"apiEndpoint\":\"$API\"}" > web/public/config.json
+```
+
+Hot reload works normally.
+
+## Project structure
 
 ```
 web/
+├── next.config.ts        # output: 'export', images unoptimized
+├── postcss.config.mjs    # Tailwind + autoprefixer
+├── tailwind.config.ts    # Theme
 ├── app/
-│   ├── api/
-│   │   └── chat/
-│   │       └── route.ts      # Bedrock API integration
-│   ├── globals.css           # Tailwind styles
-│   ├── layout.tsx            # Root layout
-│   └── page.tsx              # Main chat interface
-├── .env.example              # Environment template
-├── next.config.js            # Next.js config
-├── tailwind.config.ts        # Tailwind config
-├── tsconfig.json             # TypeScript config
-└── package.json              # Dependencies
+│   ├── layout.tsx        # Root layout, fonts, metadata
+│   ├── page.tsx          # The entire chat interface
+│   └── globals.css       # Tailwind directives
+└── out/                  # Build output (gitignored) - what CDK uploads
 ```
 
-## How It Works
+## Key implementation details
 
-### Architecture
+### Session IDs come from the server
 
+`RetrieveAndGenerate` issues session IDs and keeps conversation history server-side. A client-invented ID is rejected with a `ValidationException`, so `sessionId` starts empty and is only ever set from a response:
+
+```typescript
+const [sessionId, setSessionId] = useState('');
+
+// Omitted on the first request of a conversation
+body: JSON.stringify({
+  message: input,
+  ...(sessionId ? { sessionId } : {}),
+}),
+
+if (data.sessionId) setSessionId(data.sessionId);
 ```
-Browser ←→ Next.js API Route ←→ Bedrock Agent ←→ Knowledge Base
-                                      ↓
-                               Agent Response
+
+### Trailing-slash normalisation
+
+API Gateway stage URLs end with `/`. Appending `/chat` naively produces `/prod//chat`, which fails as a CORS error that looks like a permissions problem:
+
+```typescript
+const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
 ```
 
-### API Flow
+### The typing effect is cosmetic
 
-1. **User sends message** via web form
-2. **Next.js API route** (`/api/chat`) receives request
-3. **Bedrock Agent invoked** with user query
-4. **Response collected** from agent
-5. **Citations extracted** and displayed
-6. **Session maintained** for multi-turn conversations
+The full answer arrives in one response; the UI reveals it character by character. Real token streaming needs a different API surface than API Gateway REST with Lambda proxy integration, which buffers the whole response. See [docs/06-advanced.md](../docs/06-advanced.md#streaming-responses).
 
-### Response Implementation
+### API response shape
 
-The API route collects the complete response from the Bedrock Agent and returns it to the client. The client displays the response with a typing effect for better UX.
+```jsonc
+{
+  "response": "According to the Remote Work Policy...",
+  "citations": [{ "uri": "s3://.../remote-work-policy.md", "text": "..." }],
+  "sessionId": "issued-by-bedrock"
+}
+```
+
+Citations are already flattened and deduplicated by the Lambda.
 
 ## Customization
 
-### Styling
+| What | Where |
+|---|---|
+| Theme colours | `tailwind.config.ts`, `app/globals.css` |
+| Sample questions on the welcome screen | `app/page.tsx` |
+| Message bubble styling | `app/page.tsx` |
+| Page title and metadata | `app/layout.tsx` |
 
-Edit `tailwind.config.ts` to customize colors:
+The default sample questions reference the Nobler Works sample data - change them to match your own corpus.
 
-```typescript
-colors: {
-  primary: {
-    500: '#your-color',
-    // ...
-  }
-}
+After any change:
+
+```bash
+npm run build:web && cdk deploy
 ```
 
-### Sample Questions
-
-Edit the sample questions in `app/page.tsx`:
-
-```typescript
-const sampleQuestions = [
-  'Your custom question 1',
-  'Your custom question 2',
-  // ...
-];
-```
-
-### Message Display
-
-Customize how messages are rendered in `app/page.tsx`:
-- Change avatar icons
-- Modify message bubble styles
-- Add custom markdown components
-- Adjust citation display
-
-### Dark Mode
-
-The app automatically detects system preference. To force a theme:
-
-```typescript
-// In app/layout.tsx
-<html lang="en" className="dark"> {/* or remove for light */}
-```
-
-## Features in Detail
-
-### Response Display
-
-Responses are displayed with a typing effect for better UX:
-
-```typescript
-// Simulate typing effect character by character
-for (let i = 0; i <= fullResponse.length; i++) {
-  setCurrentResponse(fullResponse.substring(0, i));
-  await new Promise(resolve => setTimeout(resolve, 10));
-}
-```
-
-### Session Management
-
-Each browser tab gets a unique session ID:
-```typescript
-const [sessionId] = useState(() => `session-${Date.now()}`);
-```
-
-Sessions maintain conversation context, allowing follow-up questions.
-
-### Citations
-
-Source documents are extracted and displayed below responses:
-
-```typescript
-if (event.chunk?.attribution?.citations) {
-  // Extract S3 URIs
-  // Display as pills below message
-}
-```
-
-### Error Handling
-
-Graceful handling of:
-- Network errors
-- Agent errors
-- Missing configuration
-- Timeout issues
+CloudFront is invalidated on every deploy (`distributionPaths: ['/*']`), so changes appear immediately.
 
 ## Troubleshooting
 
-### "Server configuration error"
+| Symptom | Cause and fix |
+|---|---|
+| "Application not deployed" | `config.json` is missing. Re-run `npm run build:web && cdk deploy`, or create it locally as shown above. |
+| CORS error in the console | Look for `//chat` in the request URL, or a Lambda error response that didn't include CORS headers. |
+| `ValidationException` mentioning `sessionId` | A client-generated session ID was sent. Only send back one Bedrock issued. |
+| Empty or unhelpful answers | Usually the knowledge base, not the UI. Run `npm run check-status` and `./test-bedrock.sh` from the root. |
+| 500 from `/chat` | Check the Lambda logs - every request logs with a `[RAG]` prefix. |
+| Slow responses | Generation latency. Try `cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0`. |
+| `cdk deploy` fails on a missing asset | `web/out` doesn't exist. Run `npm run build:web`. |
 
-**Problem**: Agent ID or Alias ID not set
-
-**Solution**: Check your `.env` file has correct values:
-```bash
-cat .env
-```
-
-### No responses appear
-
-**Problem**: AWS credentials not configured
-
-**Solution**: Verify credentials:
-```bash
-aws sts get-caller-identity
-```
-
-### "Failed to get response"
-
-**Problem**: Agent not ready or permissions issue
-
-**Solution**:
-1. Check agent status:
-   ```bash
-   aws bedrock-agent get-agent --agent-id YOUR_AGENT_ID
-   ```
-2. Verify ingestion completed:
-   ```bash
-   npm run check-status
-   ```
-
-### Slow responses
-
-**Problem**: Large knowledge base or complex query
-
-**Solutions**:
-- Switch to Haiku model (faster, cheaper)
-- Reduce number of retrieved chunks
-- Check AWS region latency
-
-### CORS errors
-
-**Problem**: API route configuration
-
-**Solution**: Next.js API routes handle CORS automatically. If issues persist, check:
-```typescript
-// In app/api/chat/route.ts
-headers: {
-  'Access-Control-Allow-Origin': '*',
-  // ...
-}
-```
-
-## Production Deployment
-
-### Environment Variables
-
-For production, use proper secret management:
+Watch the backend:
 
 ```bash
-# Vercel
-vercel env add AGENT_ID
-vercel env add AGENT_ALIAS_ID
-
-# AWS Amplify
-# Use Amplify console to add environment variables
-
-# Docker
-docker run -e AGENT_ID=xxx -e AGENT_ALIAS_ID=xxx ...
+FN=$(aws cloudformation describe-stack-resources --stack-name S3VectorRAGStack \
+  --query "StackResources[?ResourceType=='AWS::Lambda::Function' && contains(LogicalResourceId,'BedrockApi')].PhysicalResourceId" \
+  --output text)
+aws logs tail "/aws/lambda/$FN" --follow
 ```
 
-### Building for Production
+## ⚠️ Before sharing a deployment
 
-```bash
-npm run build
-npm run start
-```
+The chat endpoint is **unauthenticated and open to the internet**, with `Access-Control-Allow-Origin: '*'`. Anyone who finds the URL can spend your Bedrock budget.
 
-### Deploy to Vercel
+Before giving anyone the link, add an authorizer, restrict CORS to your CloudFront domain, add rate limiting, and set an AWS Budget alert. See [docs/05-testing.md](../docs/05-testing.md#taking-this-to-production).
 
-```bash
-# Install Vercel CLI
-npm i -g vercel
+## Deploying elsewhere
 
-# Deploy
-vercel
+This UI is a plain static export, so it will host anywhere - Vercel, Amplify, Cloudflare Pages, any bucket. The only requirement is that a `config.json` containing `{"apiEndpoint": "..."}` is served from the site root.
 
-# Set environment variables in Vercel dashboard
-```
-
-### Deploy to AWS Amplify
-
-1. Connect your Git repository
-2. Set build settings:
-   - Build command: `npm run build`
-   - Output directory: `.next`
-3. Add environment variables
-4. Deploy
-
-### Security Considerations
-
-1. **Authentication** - Add auth before production:
-   ```typescript
-   // Use NextAuth.js, Cognito, or similar
-   import { useSession } from 'next-auth/react';
-   ```
-
-2. **Rate Limiting** - Prevent abuse:
-   ```typescript
-   // Add rate limiting middleware
-   import rateLimit from 'express-rate-limit';
-   ```
-
-3. **Input Validation** - Sanitize user input:
-   ```typescript
-   if (message.length > 1000) {
-     return error('Message too long');
-   }
-   ```
-
-4. **API Keys** - Never expose in client:
-   - Keep AWS credentials server-side
-   - Use environment variables
-   - Rotate regularly
-
-## Advanced Features
-
-### Adding Authentication
-
-```typescript
-// app/api/chat/route.ts
-import { getServerSession } from 'next-auth';
-
-export async function POST(req: NextRequest) {
-  const session = await getServerSession();
-  if (!session) {
-    return new Response('Unauthorized', { status: 401 });
-  }
-  // ...
-}
-```
-
-### User-Specific Sessions
-
-```typescript
-const [sessionId] = useState(() =>
-  `session-${userId}-${Date.now()}`
-);
-```
-
-### Message History Persistence
-
-```typescript
-// Save to database
-useEffect(() => {
-  localStorage.setItem('messages', JSON.stringify(messages));
-}, [messages]);
-
-// Load on mount
-useEffect(() => {
-  const saved = localStorage.getItem('messages');
-  if (saved) setMessages(JSON.parse(saved));
-}, []);
-```
-
-### Custom Tools Integration
-
-If your agent has custom Lambda tools, they work automatically:
-
-```typescript
-// Agent will invoke tools as needed
-// Results appear in the streamed response
-```
-
-## Performance Optimization
-
-1. **Lazy Loading**: Messages render progressively
-2. **Debouncing**: Input changes are debounced
-3. **Virtualization**: For very long conversations, add virtual scrolling
-4. **Caching**: Browser caches static assets
-
-## Browser Support
-
-- Chrome/Edge: ✅ Full support
-- Firefox: ✅ Full support
-- Safari: ✅ Full support
-- Mobile: ✅ Responsive design
-
-## Development Tips
-
-### Hot Reload
-
-Next.js automatically reloads on file changes:
-```bash
-npm run dev
-# Edit files and see changes instantly
-```
-
-### TypeScript
-
-Full type safety throughout:
-```typescript
-interface Message {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  // ...
-}
-```
-
-### Debugging
-
-View API events in browser console:
-```typescript
-console.log('Event:', event);
-```
-
-Server logs appear in terminal where `npm run dev` runs.
-
-## Resources
-
-- [Next.js Documentation](https://nextjs.org/docs)
-- [Tailwind CSS](https://tailwindcss.com/docs)
-- [Bedrock Agent Runtime API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent-runtime_InvokeAgent.html)
-- [React Markdown](https://github.com/remarkjs/react-markdown)
-
-## Support
-
-- Main tutorial: See [../README.md](../README.md)
-- API issues: Check AWS Bedrock console
-- UI issues: Check browser console
-
----
-
-Built with ❤️ using Next.js, Tailwind CSS, and Amazon Bedrock
+The CDK stack already handles this end to end, so there's no reason to host it separately unless you want a custom domain.

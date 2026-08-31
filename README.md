@@ -21,7 +21,7 @@ If you need custom software built, [get in touch](https://noblerworks.com/).
 
 # AWS Bedrock RAG Tutorial with S3 Vectors
 
-**Build a retrieval-augmented Q&A agent on Amazon Bedrock Knowledge Bases and S3 Vectors -
+**Build a retrieval-augmented Q&A system on Amazon Bedrock Knowledge Bases and S3 Vectors -
 one CDK command, a Next.js UI, and the debugging tools to see what the retriever actually returned.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-3d5a80?style=flat-square)](LICENSE)
@@ -33,41 +33,55 @@ one CDK command, a Next.js UI, and the debugging tools to see what the retriever
 
 </div>
 
+> **Tutorial:** Build a document Q&A system on AWS using Amazon Bedrock Knowledge Bases and S3 Vectors. Deployed with CDK, queried through `RetrieveAndGenerate`, with a Next.js web UI and citations.
 
-> **Tutorial:** Build a Q&A agent with AWS Bedrock Agents, Knowledge Bases, and S3 Vectors (preview). Includes CDK deployment, web UI, and comprehensive debugging tools.
+Learn how to build and deploy a **Retrieval-Augmented Generation (RAG)** system using Amazon Bedrock Knowledge Bases, Amazon S3 Vectors, and AWS CDK.
 
-Learn how to build and deploy a **Retrieval-Augmented Generation (RAG)** system using Amazon Bedrock Agents, Knowledge Bases, S3 Vectors, and AWS CDK!
+---
 
-> **📢 Important Note about S3 Vectors**
->
-> This tutorial uses **Amazon S3 Vectors** for vector storage - a new preview feature announced in July 2025. Benefits:
-> - ✅ **Up to 90% lower cost** than OpenSearch Serverless
-> - ✅ **Fully serverless** - no infrastructure to manage
-> - ✅ **Fast deployment** - less than 10 minutes vs 20-25 minutes (includes document ingestion!)
->
-> **CDK Limitation & Workarounds**: S3 Vectors is not yet supported in official AWS CDK/CloudFormation (preview feature).
-> This tutorial uses the **[cdk-s3-vectors](https://github.com/bimnett/cdk-s3-vectors)** community library by [@bimnett](https://github.com/bimnett) as a temporary workaround.
-> 🙏 **Special thanks to Bimnet Tesfamariam** for creating and maintaining this excellent library!
->
-> ⚠️ **Important**: Due to custom resource limitations, **`cdk destroy` is unreliable** - follow the manual cleanup steps in the "Cleaning Up" section below instead.
->
-> Once AWS publishes official CloudFormation support, we'll update to use native CDK constructs.
+## 📢 What changed in v2 (August 2026)
+
+If you used the original version of this tutorial, three things are materially different. All three are consequences of AWS changes, not stylistic rewrites.
+
+**1. S3 Vectors is generally available, with native CloudFormation support.**
+The original tutorial was written while S3 Vectors was in preview, and leaned on the community [cdk-s3-vectors](https://github.com/bimnett/cdk-s3-vectors) library plus a manual console-setup guide to work around the missing CloudFormation resources. Those resources now exist - `AWS::S3Vectors::VectorBucket`, `AWS::S3Vectors::Index`, and an `S3VectorsConfiguration` storage type on `AWS::Bedrock::KnowledgeBase`. The stack is now plain `aws-cdk-lib`, and the manual-setup guide is gone.
+
+**`cdk destroy` now works.** The old README's long manual-teardown checklist existed because custom resources could not clean themselves up. That is no longer the case.
+
+**2. The Bedrock Agent is gone, replaced by `RetrieveAndGenerate`.**
+On **July 30, 2026** Amazon Bedrock Agents became [Bedrock Agents Classic and closed to new customers](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-classic-maintenance-mode.html). Accounts without prior Bedrock Agents usage now get an `AccessDeniedException` on `CreateAgent`, with no exception process. Since a tutorial's readers are by definition new to the service, the agent layer would have failed for almost everyone who tried it.
+
+Bedrock **Knowledge Bases are explicitly not affected**, so the retrieval half of this tutorial is untouched. The agent has been replaced by a direct [`RetrieveAndGenerate`](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent-runtime_RetrieveAndGenerate.html) call, which performs the whole RAG loop - embed, search, prompt, generate, cite - in a single API call. It is simpler, cheaper, and available to everyone.
+
+If you specifically want an *agent* (tools, multi-step orchestration, action groups), AWS's recommended path is now [Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html), which is outside this tutorial's scope.
+
+**3. Model IDs are inference profiles now.**
+Every current Claude model on Bedrock is served **exclusively** through a cross-Region inference profile - none of them support `ON_DEMAND` invocation any more. So model IDs look like `us.anthropic.claude-opus-5`, not `anthropic.claude-3-sonnet-20240229-v1:0`. The old default model no longer exists in the Bedrock catalog at all. See [Choosing a model](#choosing-a-model).
+
+---
 
 ## What You'll Build
 
-By the end of this tutorial, you'll have a fully functional **RAG system** that:
-- Stores documents in S3 organized by domain (Financial, HR, Meeting Notes)
-- Creates a **Bedrock Knowledge Base** using S3 Vectors for vector storage
-- Uses **Amazon S3 Vectors** - a cost-effective, serverless vector database (up to 90% cheaper than OpenSearch)
-- Deploys a **Bedrock Agent** with knowledge base access
-- Provides intelligent responses using Bedrock Agents
-- Includes a beautiful **Next.js web UI** with dark mode and citations
-- **Single-command deployment** that works on the first try (no manual interventions)
-- Includes **comprehensive test script** with detailed logging for debugging
+By the end of this tutorial, you'll have a working **RAG system** that:
+
+- Stores documents in S3, organised by domain (Financial, HR, Meeting Notes)
+- Creates a **Bedrock Knowledge Base** using **S3 Vectors** for vector storage
+- Answers questions with **`RetrieveAndGenerate`**, grounded in your documents
+- Returns **citations** pointing back at the source documents
+- Serves a **Next.js web UI** through CloudFront, with dark mode and markdown rendering
+- Deploys with a **single command** and tears down with `cdk destroy`
+
+## Why S3 Vectors
+
+S3 Vectors is a serverless vector store built into S3, and it is the cheapest practical vector backend for a knowledge base of this size:
+
+- **Up to 90% lower cost** than OpenSearch Serverless, which bills for always-on capacity units
+- **Fully serverless** - no cluster, no capacity planning, no idle cost
+- **Fast to create** - a vector bucket and index come up in under a minute
+
+The tradeoff is that S3 Vectors is optimised for cost over latency. For a documentation Q&A workload this is the right trade; for high-QPS, low-latency search, OpenSearch Serverless still wins.
 
 ## Architecture
-
-This tutorial demonstrates a **S3 Vectors-based RAG architecture** - using AWS's newest serverless vector database:
 
 ```
 ┌─────────────────┐
@@ -76,742 +90,335 @@ This tutorial demonstrates a **S3 Vectors-based RAG architecture** - using AWS's
          │ HTTPS
          ↓
 ┌─────────────────────────────────────────────────────────┐
-│  CloudFront CDN (Global Edge Locations)                 │
-│  • Caches static assets                                 │
-│  • HTTPS termination                                    │
-│  • Low latency worldwide                                │
+│  CloudFront CDN                                         │
+│  • Serves the Next.js static export from S3 (via OAC)   │
+└────────┬────────────────────────────────────────────────┘
+         │
+         │  browser reads /config.json for the API URL,
+         │  then POSTs the question to API Gateway
+         ↓
+┌─────────────────────────────────────────────────────────┐
+│  API Gateway  →  Lambda (bedrock-api)                   │
+│  • One call: bedrock-agent-runtime:RetrieveAndGenerate   │
 └────────┬────────────────────────────────────────────────┘
          │
          ↓
-┌─────────────────────────────────────────────────────────┐
-│  S3 Static Website Bucket                               │
-│  • Next.js static export (HTML/CSS/JS)                  │
-│  • Beautiful dark mode UI                               │
-│  • Citation display, markdown rendering                 │
-└─────────────────────────────────────────────────────────┘
-         │
-         │ API calls
-         ↓
-┌─────────────────────────────────────────────────────────┐
-│  API Gateway REST API                                   │
-│  • CORS enabled                                         │
-│  • Rate limiting                                        │
-│  • /chat endpoint                                       │
-└────────┬────────────────────────────────────────────────┘
-         │
-         ↓
-┌─────────────────────────────────────────────────────────┐
-│  Lambda Function (bedrock-api)                          │
-│  • Invokes Bedrock Agent                                │
-│  • Collects agent responses                             │
-│  • Returns JSON with response + citations               │
-└────────┬────────────────────────────────────────────────┘
-         │
-         ↓
-┌─────────────────────────────────────────────────────────┐
-│  Bedrock Agent (Claude 3 Sonnet)                        │
-│  • Routes questions to KB                               │
-│  • Semantic search via S3 Vectors                       │
-│  • Streams responses (Claude 3.5 Haiku)                 │
-└────────┬────────────────────────────────────────────────┘
-         │
-         ↓
-┌─────────────────────────────────────────────────────────┐
-│  S3 Vectors (Vector Database)                           │
-│  • Serverless vector storage                            │
-│  • 1024-dim embeddings (Titan v2)                       │
-│  • Cosine similarity search                             │
-│  • Up to 90% cheaper than OpenSearch                    │
-└────────┬────────────────────────────────────────────────┘
-         │
-         ↑ (indexed from)
 ┌─────────────────────────────────────────────────────────┐
 │  Bedrock Knowledge Base                                 │
-│  • Chunks documents                                     │
-│  • Generates embeddings (Titan v2)                      │
-│  • Manages ingestion pipeline                           │
-└────────┬────────────────────────────────────────────────┘
+│                                                         │
+│   question ──► Titan Embeddings v2 ──► query vector     │
+│                                            │            │
+│                                            ▼            │
+│                              S3 Vectors index (cosine)  │
+│                                            │            │
+│                          top-k chunks ─────┘            │
+│                                            │            │
+│                                            ▼            │
+│                        Claude (inference profile)       │
+│                          → grounded answer + citations  │
+└─────────────────────────────────────────────────────────┘
+         ▲
+         │ ingestion (StartIngestionJob)
          │
-         ↑ (reads from)
 ┌─────────────────────────────────────────────────────────┐
-│  S3 Data Bucket                                         │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │  Financial-Data/                                  │  │
-│  │  Human-Resources/                                 │  │
-│  │  Meeting-Notes/                                   │  │
-│  │  - Q4 Reports, Budgets                            │  │
-│  │  - Employee Handbook, Benefits                    │  │
-│  │  - Meeting notes, Plans                           │  │
-│  └───────────────────────────────────────────────────┘  │
+│  S3 document bucket                                     │
+│  Financial-Data/  Human-Resources/  Meeting-Notes/      │
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Why S3 Vectors?**
-
-This architecture provides:
-- **Cost Efficiency**: Up to 90% cheaper than OpenSearch Serverless
-- **Serverless**: No infrastructure to manage, scales automatically
-- **Fast Deployment**: Less than 10 minutes vs 20-25 minutes for OpenSearch (includes document ingestion!)
-- **Simple Architecture**: Fewer moving parts, easier to maintain
-- **Preview Feature**: Early access to AWS's newest vector database technology
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the request flow in detail.
 
 ## Prerequisites
 
 > **🎓 New to AWS?**
 >
-> If you don't have an AWS account yet or need help setting up an IAM admin user, MFA, and billing alerts, watch this tutorial first:
+> If you don't have an AWS account yet or need help setting up an IAM admin user, MFA, and billing alerts, watch this first:
 >
 > **[AWS Account Setup for Beginners](https://youtu.be/DuUmIMW0Xr0?si=teRTToyPucL9Zf3Y)** (15 minutes)
 >
-> It covers:
-> - Creating a new AWS account
-> - Setting up an IAM admin user (best practice - don't use root!)
-> - Enabling MFA for security
-> - Setting up billing alerts to avoid surprises
-> - Configuring AWS CLI credentials
->
-> Once you have your admin user set up, come back here to continue!
+> Once you have an admin user set up, come back here.
 
-**Quick check** - You need:
-- ✅ AWS Account with Bedrock access enabled
-- ✅ Node.js 18+ installed
+You need:
+
+- ✅ An AWS account with **Bedrock model access enabled** (see below)
+- ✅ **Node.js 20+**
 - ✅ AWS CLI configured with credentials
-- ✅ AWS CDK installed globally: `npm install -g aws-cdk`
-- ✅ **Required IAM permissions** (see below)
+- ✅ AWS CDK: `npm install -g aws-cdk`
+- ✅ **Docker running** - CDK bundles the Lambda in a container
+- ✅ `jq` - used by `test-bedrock.sh`
+- ✅ The [required IAM permissions](#required-iam-permissions)
 
-> **Note**: This project uses npm workspaces. If you use `./deploy-complete.sh`, the script handles all dependency installation automatically. For manual deployment, run `npm install` at the root directory - it installs dependencies for both the CDK infrastructure and Next.js web UI.
+> **Note**: This project uses npm workspaces. `npm install` at the root installs both the CDK infrastructure and the Next.js web UI.
 
-### Foundation Model Selection
+### Choosing a model
 
-**This tutorial uses Claude 3.5 Haiku by default** (`anthropic.claude-3-5-haiku-20241022-v1:0`) - a fast, cost-effective model from Anthropic's Claude 3.5 family.
+**The default is `us.anthropic.claude-opus-5`.**
 
-**About Model Access:**
+Every current Claude model on Bedrock is reachable only through a **cross-Region inference profile**, so model IDs carry a Region prefix (`us.`, `eu.`, `apac.`, or `global.`). Check what your account can actually reach:
 
-AWS Bedrock now automatically grants access to most foundation models. However, **some newer models (like Claude Sonnet 4.5, Claude Opus 4) may require first-time users to submit use case details** before they can be used. This is a great strategy by AWS to ensure model availability for users with real, approved use cases!
+```bash
+# Inference profiles you can use (this is the list that matters)
+aws bedrock list-inference-profiles --region us-east-1 \
+  --query "inferenceProfileSummaries[?contains(inferenceProfileId, 'claude')].[inferenceProfileId,status]" \
+  --output table
 
-**Claude 3.5 Haiku** typically doesn't require use case submission for most users, but if you encounter access issues, you can:
-- Submit use case details (usually approved within 1-2 business days), OR
-- Switch to Amazon Nova models (guaranteed immediate access)
-
-**Want to use different models?**
-
-Just update the `foundationModel` parameter in `lib/s3-rag-stack.ts`:
-
-```typescript
-const agent = new BedrockAgentConstruct(this, 'BedrockAgent', {
-  // ... other props
-  foundationModel: 'amazon.nova-pro-v1:0', // Switch to Nova Pro
-  // OR
-  foundationModel: 'anthropic.claude-sonnet-4-5-20250929-v1:0', // Latest Claude
-});
+# Underlying foundation models and their lifecycle status
+aws bedrock list-foundation-models --region us-east-1 --by-provider anthropic \
+  --query 'modelSummaries[].[modelId,modelLifecycle.status]' --output table
 ```
 
-**Recommended alternatives:**
-- ✅ `anthropic.claude-3-5-haiku-20241022-v1:0` (default - fast, cost-effective, Claude 3.5 quality)
-- ✅ `amazon.nova-pro-v1:0` (no use case needed, great for RAG)
-- ✅ `anthropic.claude-sonnet-4-5-20250929-v1:0` (best quality, may need use case)
-- ✅ `deepseek.r1-v1:0` (strong reasoning, usually available)
+Override the model at deploy time without editing any code:
+
+```bash
+cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0
+```
+
+**Sensible choices:**
+
+| Model | When to use it |
+|---|---|
+| `us.anthropic.claude-opus-5` | Default. Best answer quality. |
+| `us.anthropic.claude-sonnet-5` | Strong quality at lower cost. |
+| `us.anthropic.claude-haiku-4-5-20251001-v1:0` | **Cheapest and fastest** - a good choice for working through the tutorial. |
+
+**About model access:** Bedrock grants access to most models automatically, but some require you to submit use-case details first (usually approved within 1-2 business days). If a query fails with `AccessDeniedException` on the model, enable it under **Model access** in the Bedrock console. `./test-bedrock.sh` diagnoses this specifically.
+
+The **embedding** model is separate and is `amazon.titan-embed-text-v2:0` (1024 dimensions). Its dimension must match the S3 Vectors index dimension - change both together in [lib/s3-rag-stack.ts](lib/s3-rag-stack.ts) if you swap it.
 
 ### Required IAM Permissions
 
-> **⚠️ IMPORTANT: Complete this step BEFORE running the deploy script!**
->
-> The deploy script **cannot grant you permissions** - you (or your AWS administrator) must attach the required IAM policy to your user/role first.
+> **⚠️ Do this BEFORE running the deploy script.** The deploy script cannot grant you permissions - you or your administrator must attach the policy first.
 
-Your AWS user/role needs the following permissions to deploy and clean up this tutorial:
-
-**Option 1: Use the provided IAM policy (Recommended)**
-
-This repository includes a ready-to-use IAM policy in `iam-policy.json` with all required permissions.
-
-**Who can do this?**
-- Your AWS account administrator
-- OR any user with `iam:CreatePolicy` and `iam:AttachUserPolicy` permissions
-- OR yourself, if you already have `AdministratorAccess`
-
-**Steps:**
+This repository ships a ready-to-use policy in [iam-policy.json](iam-policy.json). It covers the Bedrock and S3 Vectors permissions this tutorial needs, **on top of** the permissions CDK normally uses (CloudFormation, Lambda, API Gateway, CloudFront), which the CDK bootstrap roles usually provide.
 
 ```bash
-# 1. Clone the repository first
+# 1. Clone the repository
 git clone https://github.com/PatrickWiloak/bedrock-agents-rag-s3-tutorial.git
 cd bedrock-agents-rag-s3-tutorial
 
-# 2. Get your AWS account ID
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-echo "Your AWS Account ID: $AWS_ACCOUNT_ID"
+# 2. Get your AWS account ID and IAM username
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+IAM_USER=$(aws sts get-caller-identity --query Arn --output text | cut -d'/' -f2)
 
-# 3. Get your IAM username
-IAM_USERNAME=$(aws sts get-caller-identity --query 'Arn' --output text | cut -d'/' -f2)
-echo "Your IAM Username: $IAM_USERNAME"
-
-# 4. Create the IAM policy
+# 3. Create the policy
 aws iam create-policy \
-  --policy-name BedrockRAGTutorialPolicy \
-  --policy-document file://iam-policy.json \
-  --description "Permissions for AWS Bedrock RAG Tutorial"
+  --policy-name BedrockRagTutorialPolicy \
+  --policy-document file://iam-policy.json
 
-# 5. Attach policy to your user
+# 4. Attach it to your user
 aws iam attach-user-policy \
-  --user-name $IAM_USERNAME \
-  --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/BedrockRAGTutorialPolicy
-
-echo "✅ IAM policy attached! You can now run the deploy script."
+  --user-name "$IAM_USER" \
+  --policy-arn "arn:aws:iam::${ACCOUNT_ID}:policy/BedrockRagTutorialPolicy"
 ```
 
-**Option 2: Use AdministratorAccess (Development only)**
-
-For development/learning purposes, you can use the AWS managed `AdministratorAccess` policy, which includes all required permissions. If you already have this, skip to "Quick Start" below.
-
-**What permissions are included?**
-
-The `iam-policy.json` file grants permissions for:
-- **Bedrock**: Create/delete agents, knowledge bases, data sources, invoke models
-- **S3 Vectors**: Create/delete vector buckets and indexes
-- **S3**: Manage buckets and objects for document storage
-- **IAM**: Pass roles to Bedrock service
-- **Plus**: CloudFormation, Lambda, API Gateway, CloudFront (for CDK deployment)
-
-> **💡 Why this approach?**
->
-> We provide a minimal IAM policy (principle of least privilege) so you can:
-> - Deploy and clean up the tutorial without `AdministratorAccess`
-> - Understand exactly what permissions are needed
-> - Use this in organizational AWS accounts with permission restrictions
-> - Avoid "Access Denied" errors during deployment or cleanup
+If you already have `AdministratorAccess`, you can skip this.
 
 ## Quick Start
 
-> **💡 Which option should I choose?**
-> - **Just want the gist of it?** → Option 1 (Complete Automated) - Our script handles everything!
-> - **Want to understand the deployment process?** → Option 2 (Infrastructure Only)
-> - **Want to learn everything in depth?** → Option 3 (Manual CDK)
-> - **Building a production system?** → Read the full tutorial in `docs/`
-
-### Option 1: Complete Automated Setup (Fastest) 🚀
-
-**Perfect for:** Just want the gist of it? Our deployment script takes care of everything!
-
-**Best if:** You want to see the system working immediately without manual steps
+### Option 1: Automated setup (fastest) 🚀
 
 ```bash
-# Clone and deploy - everything automated!
 git clone https://github.com/PatrickWiloak/bedrock-agents-rag-s3-tutorial.git
 cd bedrock-agents-rag-s3-tutorial
-./deploy-complete.sh
-```
-
-**This single script handles:**
-- ✅ Prerequisites check (Node.js, AWS CLI, CDK)
-- ✅ AWS credentials verification
-- ✅ **Dependency installation** (CDK + web UI via npm workspaces)
-- ✅ CDK bootstrap (if needed)
-- ✅ Infrastructure deployment (15 mins)
-- ✅ Document upload (17 sample docs)
-- ✅ Ingestion monitoring (waits until ready)
-- ✅ Ready-to-use RAG system!
-
-**No manual `npm install` needed** - the script does it all! 🎯
-
-**Time:** Less than 10 minutes total (hands-off) - includes full deployment AND document ingestion!
-
-**What happens during deployment:**
-
-- **~10 seconds**: Prerequisites check and project setup
-- **~5-7 minutes**: CloudFormation deployment (S3 Vectors is FAST!)
-  - S3 buckets, S3 Vector buckets, and indexes
-  - IAM roles, Knowledge Bases, and Bedrock Agent creation
-  - CloudFormation stack finalization
-- **~30 seconds**: Uploading 17 sample documents to S3
-- **~2-3 minutes**: Knowledge Base ingestion (AWS chunks documents, generates embeddings, indexes vectors)
-  - Documents are split into chunks
-  - Each chunk gets embedded using Titan Embeddings v2
-  - Vectors are stored in S3 Vector buckets for similarity search
-  - Processing happens in parallel
-
-**The speed advantage?** S3 Vectors deploys in less than 10 minutes total vs 20-25 minutes for OpenSearch Serverless - that's more than 2x faster! ⚡
-
-### Option 2: Infrastructure Only (Understanding the Process) 📚
-
-**Perfect for:** Learning how RAG systems work, understanding deployment steps
-
-**Best if:** You want to see each phase of deployment and understand what's happening
-
-```bash
-# Deploy CDK stack only
 ./deploy.sh
-
-# Then manually upload and test
-npm run upload-docs
-npm run test-agent
 ```
 
-**Why this option?**
-- See exactly what `npm run upload-docs` does
-- Understand document ingestion process
-- Learn how Knowledge Bases are populated
-- Good balance of automation and understanding
+The script installs dependencies, builds the web UI, bootstraps CDK if needed, deploys the stack, uploads the sample documents, waits for ingestion, and prints the CloudFront URL.
 
-### Option 3: Manual CDK Deployment (Deep Learning) 🎓
-
-**Perfect for:** Developers who want to master CDK, customize everything, learn in depth
-
-**Best if:** You want complete control and deep understanding of every component
-
-**Why this option?**
-- Understand every CDK construct
-- See how each resource is created
-- Learn CloudFormation stack structure
-- Perfect foundation for customization
-- **Recommended if:** You're planning to build production RAG systems
+### Option 2: Step by step (recommended for learning) 🎓
 
 ```bash
-# Install dependencies
+# Install dependencies (root + web workspace)
 npm install
 
-# Bootstrap CDK (first time only)
+# Build the Next.js static export - the stack uploads web/out
+npm run build:web
+
+# Bootstrap CDK (first time in this account/Region only)
 cdk bootstrap
 
-# Deploy the stack
+# Deploy
 cdk deploy
 
-# Upload sample documents
+# Upload the sample documents and start ingestion
 npm run upload-docs
 
-# Test your RAG system
-npm run test-agent
+# Watch ingestion finish (2-5 minutes)
+npm run check-status
+
+# Ask it questions
+npm run test-rag
+npm run test-rag interactive
 ```
 
-**Why this option?**
-- Full control over each deployment step
-- Learn CDK patterns and best practices
-- Understand AWS service interactions
-- Customize resources before deployment
-- Troubleshoot issues at granular level
-
-### Option 4: Web UI (Best Experience) 🌐
-
-**Perfect for:** Interactive exploration, demos, production-like usage
-
-**Best if:** You want a beautiful interface with citations and chat functionality
+### Option 3: Local web UI development 💻
 
 ```bash
-# Deploy infrastructure (same as above)
-npm install
-cdk bootstrap
-cdk deploy
-npm run upload-docs
-
-# Start web interface
-npm run build:web        # Build Next.js app
-cd web
-npm run setup            # Auto-configures from CloudFormation
-npm run dev
-
-# Open http://localhost:3000
+npm run build:web       # or: npm run dev --workspace=web
 ```
 
----
+See [web/README.md](web/README.md) for the UI development workflow.
 
-## 📖 Suggested Learning Path
+### Verifying a deployment
 
-**New to RAG systems?** We recommend this progressive approach:
-
-### Week 1: Quick Win
-1. Run `./deploy-complete.sh` to see the system working
-2. Try the sample questions
-3. Play with the web UI (after root `npm install`, then `cd web && npm run dev`)
-4. **Goal:** Understand what's possible with RAG
-
-### Week 2: Understanding
-1. Follow manual cleanup steps (see "Cleaning Up" section below)
-2. Deploy again using `./deploy.sh`
-3. Manually run `npm run upload-docs` and watch the process
-4. Read `docs/01-understanding.md` while ingestion runs
-5. **Goal:** Understand the RAG workflow
-
-### Week 3: Deep Dive
-1. Destroy and redeploy using manual CDK commands
-2. Read through all `lib/*.ts` CDK constructs
-3. Follow the full tutorial in `docs/` folder
-4. Customize the agent instructions
-5. Add your own documents
-6. **Goal:** Master the architecture and customize it
-
-### Week 4: Production
-1. Implement multi-environment setup (dev/staging/prod)
-2. Add monitoring and logging
-3. Implement security best practices
-4. Optimize for cost and performance
-5. **Goal:** Production-ready RAG system
-
-**Don't have 4 weeks?** No problem! Just pick the level that matches your needs.
-
----
+`./test-bedrock.sh` walks the whole stack bottom-up - credentials, stack outputs, model access, knowledge base state, ingestion status, and a real end-to-end query - and stops at the first thing that is actually broken. Run it whenever something doesn't work.
 
 ## Sample Data: Nobler Works
 
-This tutorial includes **realistic sample documents** for a fictional SaaS company called Nobler Works The documents are organized into three knowledge base domains:
+The tutorial includes **17 realistic sample documents** for a fictional SaaS company, organised into three folders. Alongside the Markdown files listed below, six are `.docx` - deliberately, so you can see Bedrock's parsing handle more than plain text:
 
 ### 📊 Financial-Data/
-- **Q4 2024 Quarterly Report** - Complete financial results ($12.4M revenue, profitability metrics)
-- **2025 Annual Budget** - Departmental budgets, headcount plan, $52.8M total budget
-- **Corporate Expense Policy** - Travel, meals, equipment reimbursement guidelines
-- **Accounts Receivable Aging Report** - AR analysis, collection strategies, DSO metrics
+- **Q4 2024 Quarterly Report** - financial results ($12.4M revenue, profitability metrics)
+- **2025 Annual Budget** - departmental budgets, headcount plan, $52.8M total
+- **Corporate Expense Policy** - travel, meals, equipment reimbursement
+- **Accounts Receivable Aging Report** - AR analysis, collections, DSO metrics
 
 ### 👥 Human-Resources/
-- **Employee Handbook** - Employment policies, compensation, benefits overview
-- **Benefits Guide 2025** - Detailed medical, dental, vision, 401(k), PTO information
-- **Remote Work Policy** - Hybrid/full-remote guidelines, home office stipends
-- **Performance Review Guidelines** - Rating scale, calibration process, PIP procedures
+- **Employee Handbook** - employment policies, compensation, benefits overview
+- **Benefits Guide 2025** - medical, dental, vision, 401(k), PTO
+- **Remote Work Policy** - hybrid/remote guidelines, home office stipends
+- **Performance Review Guidelines** - rating scale, calibration, PIP procedures
 
 ### 📝 Meeting-Notes/
 - **Executive Leadership Meeting (Jan 2025)** - Q4 results, 2025 strategy, org changes
 - **Product Roadmap Planning (Q1 2025)** - AI features, mobile app, API marketplace
 - **Engineering Sprint Retrospective** - Sprint 24 review, velocity, technical debt
 
-**Try these sample questions:**
+Plus `.docx` versions of the dress code, vacation policy, employee handbook, and three further meeting notes.
+
+**Try these questions:**
 - "What was our Q4 2024 revenue?"
 - "What are our PTO benefits?"
 - "What are the company's top priorities for 2025?"
 - "What's our remote work policy?"
 - "How much is the home office stipend?"
-- "What were the action items from the executive meeting?"
 
 ## Tutorial Structure
 
-This tutorial is organized into progressive steps:
+| Chapter | What it covers |
+|---|---|
+| [01 - Understanding RAG](docs/01-understanding.md) | What RAG is, how embeddings and vector search work, why S3 Vectors |
+| [02 - Infrastructure](docs/02-infrastructure.md) | The CDK stack, resource by resource |
+| [03 - Querying](docs/03-querying.md) | `RetrieveAndGenerate`, sessions, citations |
+| [04 - Customization](docs/04-customization.md) | Chunking, prompt templates, models, retrieval tuning |
+| [05 - Testing](docs/05-testing.md) | Test scripts, evaluating answer quality, debugging |
+| [06 - Advanced](docs/06-advanced.md) | Metadata filtering, multiple knowledge bases, guardrails, production concerns |
+| [07 - Web Interface](docs/07-web-interface.md) | The Next.js UI, API Gateway, Lambda, CloudFront |
 
-### 📘 Step 1: Understanding the Basics
-Learn about RAG, Bedrock, and the components we'll use.
-
-### 🏗️ Step 2: Setting Up Infrastructure
-Deploy S3 buckets and Bedrock Knowledge Base using CDK.
-
-### 🤖 Step 3: Creating Your First Agent
-Build a basic Bedrock agent with knowledge base integration.
-
-### 🎨 Step 4: Customizing Your Agent
-Add custom instructions, guardrails, and tool integration.
-
-### 🚀 Step 5: Testing & Deployment
-Test your agent and deploy to production.
-
-### 🔧 Step 6: Advanced Customization
-Add Lambda functions, API Gateway, and custom tools.
-
-### 💻 Step 7: Building a Web Interface
-Create a beautiful chat UI with Next.js, Tailwind CSS, and Bedrock Agents.
+Also see [docs/S3-VECTORS-SETUP.md](docs/S3-VECTORS-SETUP.md) for S3 Vectors specifics and limits.
 
 ## Project Structure
 
 ```
 bedrock-agents-rag-s3-tutorial/
-├── README.md                    # This file
-├── LOCAL_DEVELOPMENT.md         # Web UI development guide
-├── QUICKSTART.md                # 10-minute quick start
-├── docs/                        # Tutorial documentation
-│   ├── 01-understanding.md
-│   ├── 02-infrastructure.md
-│   ├── 03-first-agent.md
-│   ├── 04-customization.md
-│   ├── 05-testing.md
-│   └── 06-advanced.md
-├── lib/                         # CDK constructs
-│   ├── s3-rag-stack.ts
-│   ├── knowledge-base-construct.ts
-│   └── bedrock-agent-construct.ts
-├── bin/                         # CDK app entry point
-│   └── s3-rag-app.ts
-├── sample-data/                 # Sample documents
-│   └── knowledge-docs/
-├── scripts/                     # Utility scripts
-│   ├── upload-documents.ts
-│   ├── test-agent.ts
-│   └── check-status.ts
-├── web/                         # Next.js web UI
-│   ├── app/                     # Next.js app directory
-│   │   ├── api/chat/           # Bedrock API integration
-│   │   ├── page.tsx            # Chat interface
-│   │   └── globals.css         # Tailwind styles
-│   ├── package.json
-│   └── README.md               # Web UI documentation
-└── cdk.json                     # CDK configuration
+├── README.md                       # This file
+├── ARCHITECTURE.md                 # Request flow in detail
+├── QUICKSTART.md                   # 10-minute quick start
+├── CLAUDE.md                       # Context for AI assistants working here
+├── TODO.md                         # Open work on this repo
+├── deploy.sh                       # One-command deployment
+├── test-bedrock.sh                 # Bottom-up deployment diagnostic
+├── iam-policy.json                 # Permissions needed to deploy
+├── docs/                           # Tutorial chapters 01-07
+├── bin/
+│   └── s3-rag-app.ts               # CDK app entry point
+├── lib/
+│   ├── s3-rag-stack.ts             # The stack: bucket, KB, web hosting
+│   ├── knowledge-base-construct.ts # S3 Vectors + Knowledge Base + data source
+│   └── web-hosting-construct.ts    # Lambda + API Gateway + CloudFront + S3
+├── lambda/
+│   └── bedrock-api.ts              # RetrieveAndGenerate handler
+├── scripts/
+│   ├── upload-documents.ts         # Upload sample docs, start ingestion
+│   ├── test-rag.ts                 # Query from the terminal (demo/interactive)
+│   └── check-status.ts             # Ingestion job status
+├── sample-data/knowledge-docs/     # The Nobler Works documents
+└── web/                            # Next.js static-export UI
+    ├── next.config.ts              # output: 'export'
+    └── app/page.tsx                # Chat interface
 ```
 
 ## What You'll Learn
 
-### AWS Services
-- Amazon S3 for document storage
-- Amazon S3 Vectors for serverless vector search
-- Amazon Bedrock for AI/ML capabilities (Knowledge Bases, Agents, Models)
-- AWS Lambda for custom resources
-- IAM roles and policies
+**AWS services** - S3, S3 Vectors, Bedrock Knowledge Bases, Bedrock runtime models, Lambda, API Gateway, CloudFront, IAM.
 
-### CDK Concepts
-- Stack and Construct patterns
-- Infrastructure as Code best practices
-- Resource dependencies
-- Environment configuration
+**CDK** - stacks and constructs, L1 vs L2, resource dependencies, IAM grants, asset bundling, static site deployment.
 
-### RAG Concepts
-- Document chunking and embeddings
-- Vector similarity search
-- Prompt engineering
-- Context retrieval
+**RAG** - chunking and overlap, embeddings and dimensions, cosine similarity, top-k retrieval, grounding and citations, prompt templates.
 
-### Bedrock Agents API
-- Agent configuration
-- Knowledge base integration
-- Agent responses
-- Multi-turn conversations
+**Bedrock APIs** - `RetrieveAndGenerate`, `Retrieve`, ingestion jobs, inference profiles, and why the distinction between a foundation model and an inference profile matters for IAM.
 
 ## Customization Points
 
-Throughout this tutorial, you'll learn how to customize:
+1. **Document processing** - chunk size and overlap ([lib/s3-rag-stack.ts](lib/s3-rag-stack.ts)), file formats, metadata
+2. **Answer style** - the `PROMPT_TEMPLATE` constant in [lib/s3-rag-stack.ts](lib/s3-rag-stack.ts)
+3. **Retrieval** - `numberOfResults`, metadata filtering, search type
+4. **Model** - `--context modelId=...` at deploy time, or the `DEFAULT_MODEL_ID` constant
 
-1. **Document Processing**
-   - Chunk size and overlap
-   - Metadata extraction
-   - File format support
+See [docs/04-customization.md](docs/04-customization.md).
 
-2. **Agent Behavior**
-   - System prompts and instructions
-   - Response style and tone
-   - Guardrails and content filtering
+## Cost & Cleanup
 
-3. **Knowledge Retrieval**
-   - Number of retrieved chunks
-   - Similarity thresholds
-   - Metadata filtering
+Running this tutorial costs roughly **$1-5 total**, dominated by model inference:
 
-4. **Tool Integration**
-   - Custom Lambda functions
-   - API integrations
-   - Database queries
+| Service | Cost |
+|---|---|
+| S3 (documents) | ~$0.023/GB/month - negligible at this size |
+| S3 Vectors | Pay per request and per GB stored - cents for this dataset |
+| Bedrock embeddings | One-off at ingestion; Titan v2 is very cheap |
+| Bedrock generation | The main cost. Per token, varies a lot by model - Haiku 4.5 is far cheaper than Opus 5 |
+| Lambda / API Gateway | Free tier covers tutorial usage |
+| CloudFront | Free tier covers tutorial usage |
 
-## Cost Estimation & Cleanup
+### Cleanup
 
-Running this tutorial will incur AWS costs:
-- **S3**: ~$0.023/GB/month (minimal - just document storage)
-- **S3 Vectors**: Pay-per-request (very low for testing)
-- **Bedrock**: Pay per token (varies by model)
-- **Lambda**: Free tier covers testing
-
-**Total estimated cost**: ~$1-5 for completing the tutorial
-
-### ⚠️ IMPORTANT: Cleanup to Avoid Ongoing Costs
-
-**When you're done with the tutorial, DELETE ALL RESOURCES to avoid charges.**
-
-## Two Cleanup Options
-
-| | Option A: Proper Order | Option B: Force Delete |
-|---|---|---|
-| **Method** | Delete resources manually in correct order | CloudFormation stack force delete |
-| **Time** | 3-5 minutes | 30 seconds |
-| **Result** | ✅ Clean - no orphans | ⚠️ May leave orphaned KB |
-| **Cost Risk** | None | None (orphans cost $0) |
-| **Best For** | Clean teardown | Stuck stacks, urgent cleanup |
-
-### Option A: Proper Order (Recommended - Clean Deletion)
-
-**Deleting in the correct order prevents orphaned resources:**
-
-1. Delete Bedrock Agent first
-2. Delete Knowledge Base second
-3. Delete S3 Vector buckets
-4. Delete S3 data bucket
-5. Delete CloudFormation stack last
-
-**Result**: ✅ Clean deletion, no orphaned resources
-**Time**: 3-5 minutes
-**Follow the detailed steps below** →
-
----
-
-### Option B: Force Delete CloudFormation Stack (Faster)
-
-**When to use**: Stack is stuck in `ROLLBACK_FAILED` or you're in a hurry
+Everything in the stack is native CloudFormation, so teardown is one command:
 
 ```bash
-aws cloudformation delete-stack --stack-name S3VectorRAGStack --region us-east-1
+npm run destroy      # or: cdk destroy
 ```
 
-**⚠️ What Happens**:
-- CloudFormation stack deleted immediately
-- **May leave orphaned Knowledge Base** in `DELETE_UNSUCCESSFUL` status
-- **No charges incurred**: Orphaned KBs cost $0 (no underlying vector store)
-- **Won't affect future deployments**: Next deployment uses unique timestamp
+This removes the document bucket, the vector bucket and index, the knowledge base, the data source, the website bucket, CloudFront, API Gateway, and the Lambda.
 
-**Orphaned Resources Are Safe**:
-- ✅ No cost - KB metadata only, no compute/storage
-- ✅ No conflicts - your next deployment has unique names
-- ✅ Optional removal - contact AWS Support if you want it cleaned up
+> **The old manual-teardown checklist is no longer needed.** It existed because the preview-era custom resources could not reliably delete themselves. If you deployed the *original* version of this tutorial, that stack still needs the manual steps - see the [v1 README](https://github.com/PatrickWiloak/bedrock-agents-rag-s3-tutorial/blob/e7b0810/README.md#detailed-cleanup-steps-option-a).
 
-**To check for orphans**:
+Confirm nothing is left behind:
+
 ```bash
-aws bedrock-agent list-knowledge-bases --region us-east-1 --query "knowledgeBaseSummaries[?starts_with(name, 'kb-')]"
+aws cloudformation describe-stacks --stack-name S3VectorRAGStack   # should error: does not exist
+aws s3vectors list-vector-buckets --region us-east-1
+aws bedrock-agent list-knowledge-bases --region us-east-1
 ```
-
-If you see KB with `DELETE_UNSUCCESSFUL`, it's harmless. Leave it or contact AWS Support.
-
----
-
-## Detailed Cleanup Steps (Option A)
-
-**Delete resources in this exact order:**
-
-### Step 1: Delete Bedrock Agent
-
-**Why first?** The agent uses the knowledge base, so delete the agent before the KB.
-
-1. Open [Bedrock Agents Console](https://console.aws.amazon.com/bedrock/home?region=us-east-1#/agents)
-2. Find agent: `agent-{YOUR_ACCOUNT_ID}-{TIMESTAMP}` (e.g., `agent-791588190257-251021-1540`)
-3. Select the agent → Click **Delete**
-4. Confirm deletion
-5. ✅ Wait for "Agent deleted successfully" message
-
----
-
-### Step 2: Delete Knowledge Base
-
-**Why second?** The KB uses S3 Vectors, so delete the KB before the vector store.
-
-1. Open [Bedrock Knowledge Bases Console](https://console.aws.amazon.com/bedrock/home?region=us-east-1#/knowledge-bases)
-2. Find KB: `kb-{YOUR_ACCOUNT_ID}-{TIMESTAMP}` (e.g., `kb-791588190257-251021-1540`)
-3. Select the KB → Click **Delete**
-4. ⚠️ **IMPORTANT**: When prompted:
-   - **DO check** "Delete associated data sources"
-   - This deletes the S3 data source connection
-5. Confirm deletion
-6. ✅ Wait for deletion to complete (may take 30-60 seconds)
-
-**⚠️ Troubleshooting**: If the KB gets stuck in `DELETE_UNSUCCESSFUL` status:
-- Don't worry - this happens if S3 Vectors were already deleted
-- The KB will eventually be cleaned up (may take a few minutes)
-- Continue with next steps
-
----
-
-### Step 3: Delete S3 Vector Store
-
-**Why third?** Must delete indexes before deleting the vector bucket.
-
-1. Open [S3 Vectors Console](https://console.aws.amazon.com/s3/home?region=us-east-1#/vectors)
-2. Find vector bucket: `kb-{YOUR_ACCOUNT_ID}-{TIMESTAMP}-vectors-{YOUR_ACCOUNT_ID}-us-east-1`
-   - Example: `kb-791588190257-251021-1540-vectors-791588190257-us-east-1`
-3. **First: Delete all indexes**
-   - Click on the vector bucket
-   - Select all indexes (should be `kb-{YOUR_ACCOUNT_ID}-{TIMESTAMP}-index`)
-   - Click **Delete** → Confirm
-   - ✅ Wait for indexes to be deleted
-4. **Then: Delete the vector bucket**
-   - Go back to vector buckets list
-   - Select the vector bucket
-   - Click **Delete** → Confirm
-
-**⚠️ Note**: You MUST delete indexes before the bucket, or deletion will fail.
-
----
-
-### Step 4: Delete S3 Data Bucket
-
-**Why fourth?** This bucket holds your documents - can be deleted anytime after the KB.
-
-1. Open [S3 Console](https://s3.console.aws.amazon.com/s3/buckets?region=us-east-1)
-2. Find bucket: `docs-{YOUR_ACCOUNT_ID}-us-east-1-{TIMESTAMP}`
-   - Example: `docs-791588190257-us-east-1-251021-1540`
-3. **First: Empty the bucket**
-   - Click on the bucket name
-   - Click **Empty** button (top right)
-   - Type `permanently delete` to confirm
-   - Click **Empty**
-   - ✅ Wait for "Successfully emptied" message
-4. **Then: Delete the bucket**
-   - Go back to buckets list
-   - Select `bedrock-rag-tutorial-docs-{YOUR_ACCOUNT_ID}-us-east-1`
-   - Click **Delete**
-   - Type the bucket name to confirm
-   - Click **Delete bucket**
-
----
-
-### Step 5: Delete CloudFormation Stack (Optional)
-
-**Why optional?** All actual AWS resources are already deleted - the stack is just metadata.
-
-1. Open [CloudFormation Console](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks)
-2. Find stack: `S3VectorRAGStack`
-3. Select the stack → Click **Delete**
-4. Confirm deletion
-
-**⚠️ If CloudFormation delete fails**:
-- This is NORMAL and expected with S3 Vectors custom resources
-- The stack might show `DELETE_FAILED` status
-- **Don't worry** - all actual resources are already deleted (Steps 1-4)
-- The CloudFormation stack is just metadata and costs nothing
-- You can safely leave it or contact AWS Support to remove it
-
-**⚠️ If Knowledge Base gets stuck in DELETE_UNSUCCESSFUL**:
-- This happens if the S3 Vector store was deleted before the KB
-- The KB is trying to reference vectors that no longer exist
-- **Don't worry** - the KB costs nothing and can't be used (no underlying resources)
-- Your new deployments will NOT be affected (globally-unique resource names)
-- The KB will eventually be cleaned up by AWS (may take days/weeks)
-- Or contact AWS Support to manually remove it
-
-**Why does it fail?** CloudFormation tries to delete custom resources (S3 Vectors) that are already gone, causing timeouts. This is a limitation of the `cdk-s3-vectors` community library and S3 Vectors' lack of official CDK support.
-
-**✅ Verification**: Check [AWS Cost Explorer](https://console.aws.amazon.com/cost-management/home#/cost-explorer) 24-48 hours after cleanup to ensure no costs are accruing.
-
----
-
-## ⚠️ Why Not Use `cdk destroy`?
-
-You might be wondering why we recommend manual cleanup instead of `cdk destroy`:
-
-**The Problem:**
-- S3 Vectors is a preview feature without official CDK support
-- This tutorial uses `cdk-s3-vectors` (community library with custom CloudFormation resources)
-- When you run `cdk destroy`, CloudFormation tries to delete custom resources
-- Custom resources often timeout or fail when trying to clean up S3 Vector stores
-- This leaves your stack in `DELETE_FAILED` state - very frustrating!
-
-**The Solution:**
-- Follow the manual steps above to delete actual AWS resources
-- CloudFormation stack failures are harmless (just metadata, no cost)
-- Manual cleanup works 100% of the time
-
-**Future**: Once AWS releases official CDK support for S3 Vectors, `cdk destroy` should work reliably.
 
 ## Getting Help
 
-### Resources
-- Check the [docs/](docs/) folder for detailed step-by-step guides
-- Review CDK patterns in [lib/](lib/) folder
-- [QUICKSTART.md](QUICKSTART.md) - 10-minute quick start guide
+- Run `./test-bedrock.sh` first - it names the specific failing layer
+- Chapter [05 - Testing](docs/05-testing.md) has a troubleshooting table
+- [QUICKSTART.md](QUICKSTART.md) for the condensed path
 
-### Official AWS Documentation
-- **S3 Vectors**: [Overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html) | [Getting Started](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-getting-started.html)
-- **Bedrock**: [Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html) | [Agents](https://docs.aws.amazon.com/bedrock/latest/userguide/agents.html)
-- **AWS CDK**: [Developer Guide](https://docs.aws.amazon.com/cdk/v2/guide/home.html)
+### Official AWS documentation
+
+- **S3 Vectors**: [Overview](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html) | [Getting started](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-getting-started.html)
+- **Bedrock Knowledge Bases**: [User guide](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html) | [RetrieveAndGenerate API](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent-runtime_RetrieveAndGenerate.html)
+- **Inference profiles**: [Supported Regions and models](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html)
+- **Bedrock AgentCore**: [What is AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html) - if you need agents
+- **AWS CDK**: [Developer guide](https://docs.aws.amazon.com/cdk/v2/guide/home.html)
 
 ---
 
 ## Credits & Acknowledgments
 
-### Community Libraries
+### Community libraries
 
-This tutorial relies on the excellent **[cdk-s3-vectors](https://github.com/bimnett/cdk-s3-vectors)** library:
-- **Author**: Bimnet Tesfamariam ([@bimnett](https://github.com/bimnett))
-- **Purpose**: CDK constructs for Amazon S3 Vectors (preview feature)
-- **Why we use it**: S3 Vectors is not yet available in official AWS CDK/CloudFormation
-- **License**: Apache 2.0
-- 🙏 **Huge thanks** to Bimnet for creating and maintaining this library, making S3 Vectors accessible to the CDK community!
+Versions 1.x of this tutorial were built on **[cdk-s3-vectors](https://github.com/bimnett/cdk-s3-vectors)** by Bimnet Tesfamariam ([@bimnett](https://github.com/bimnett)), which provided CDK constructs for S3 Vectors during the preview, before AWS published CloudFormation support.
 
-Without this community contribution, building S3 Vectors-based applications with CDK would be significantly more complex.
+v2 uses the now-native `aws-cdk-lib/aws-s3vectors` constructs and no longer depends on it - but that library is the reason this tutorial existed at all during the preview period. 🙏 Thank you, Bimnet.
 
-### Tutorial Authors
+### Tutorial authors
 
-- **Patrick Wiloak** - Architecture, implementation, and documentation
-- **Daniel Casale** - Collaboration and testing
+- **Patrick Wiloak** - architecture, implementation, and documentation
+- **Daniel Casale** - collaboration and testing
+
+## License
+
+MIT - see [LICENSE](LICENSE).

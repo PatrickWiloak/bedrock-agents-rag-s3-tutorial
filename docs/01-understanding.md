@@ -1,326 +1,222 @@
 # Step 1: Understanding the Basics
 
+Before deploying anything, it's worth understanding what you're building and why each piece exists.
+
 ## What is RAG?
 
-**Retrieval-Augmented Generation (RAG)** is a technique that enhances large language models (LLMs) by providing them with relevant context from your own data sources.
+**Retrieval-Augmented Generation** gives a language model access to information it was never trained on, by looking that information up at query time and putting it in the prompt.
 
-### The Problem RAG Solves
+### The problem RAG solves
 
-Traditional LLMs have limitations:
-- Knowledge cutoff dates
-- No access to your private/proprietary data
-- Can hallucinate when uncertain
-- Cannot provide citations or sources
+A foundation model knows what was in its training data. It does not know:
 
-### How RAG Works
+- Your company's Q4 revenue
+- Your PTO policy
+- What was decided in last week's leadership meeting
+- Anything that happened after its training cutoff
+
+Ask it anyway and you get one of two bad outcomes: a refusal, or a confident invention. RAG fixes this by retrieving the relevant passages from *your* documents first, then asking the model to answer using only those passages.
+
+### How RAG works
 
 ```
-┌──────────────┐
-│ User Query   │
-└──────┬───────┘
-       │
-       v
-┌──────────────────────┐
-│ Vector Search        │ ← Finds relevant chunks
-│ (Similarity Search)  │
-└──────┬───────────────┘
-       │
-       v
-┌──────────────────────┐
-│ Retrieved Context    │
-│ + Original Query     │
-└──────┬───────────────┘
-       │
-       v
-┌──────────────────────┐
-│ LLM Generation       │ ← Generates answer
-│ with Context         │
-└──────┬───────────────┘
-       │
-       v
-┌──────────────────────┐
-│ Response with        │
-│ Citations            │
-└──────────────────────┘
+                          INGESTION (once per document change)
+┌──────────┐    ┌──────────┐    ┌────────────┐    ┌──────────────┐
+│ Document │───►│  Chunk   │───►│   Embed    │───►│ Vector store │
+└──────────┘    └──────────┘    └────────────┘    └──────────────┘
+
+                          QUERY (every question)
+┌──────────┐    ┌────────────┐    ┌──────────────┐    ┌───────────┐
+│ Question │───►│   Embed    │───►│Similarity    │───►│  Top-k    │
+└──────────┘    └────────────┘    │search        │    │  chunks   │
+                                  └──────────────┘    └─────┬─────┘
+                                                            │
+                    ┌───────────────────────────────────────┘
+                    ▼
+          ┌──────────────────────┐    ┌──────────────────┐
+          │ Prompt = template +  │───►│ Foundation model │──► Answer
+          │ chunks + question    │    └──────────────────┘    + citations
+          └──────────────────────┘
 ```
 
-### RAG Components
+The key insight: **the model isn't trained on your data, and isn't fine-tuned. It's handed the relevant text at query time.** Update a document, re-run ingestion, and the answers change immediately.
 
-1. **Document Store**: S3 bucket with your files
-2. **Embedding Model**: Converts text to vectors
-3. **Vector Database**: Stores embeddings for fast search
-4. **LLM**: Generates responses using retrieved context
-5. **Orchestrator**: Coordinates the workflow
+### RAG components
+
+| Component | Role | What this tutorial uses |
+|---|---|---|
+| Document store | Holds the source files | Amazon S3 |
+| Chunker | Splits documents into retrievable pieces | Bedrock fixed-size chunking |
+| Embedding model | Turns text into vectors | Titan Text Embeddings V2 |
+| Vector store | Stores vectors, does similarity search | **Amazon S3 Vectors** |
+| Retriever | Finds the top-k relevant chunks | Bedrock Knowledge Base |
+| Generator | Writes the answer | Claude, via a Bedrock inference profile |
+| Orchestrator | Wires the above together | `RetrieveAndGenerate` (one API call) |
 
 ## What is Amazon Bedrock?
 
-Amazon Bedrock is a fully managed service for building AI applications with foundation models.
+Bedrock is AWS's managed service for foundation models. You call an API; AWS runs the model. No GPUs to provision, no model weights to host.
 
-### Key Features
+### Key features used here
 
-- **Multiple Models**: Claude, Llama, Titan, and more
-- **No Infrastructure**: Fully serverless
-- **Enterprise Ready**: Security, compliance, privacy
-- **RAG Support**: Built-in knowledge bases
+- **Foundation models** from Anthropic, Amazon, Meta, Cohere and others behind one API
+- **Knowledge Bases** - managed RAG: ingestion, chunking, embedding, retrieval, and generation
+- **Inference profiles** - cross-Region routing for capacity and throughput
+- **Guardrails** - content filtering and topic restrictions (see [chapter 06](06-advanced.md))
 
-### Foundation Models
+### Foundation models and inference profiles
 
-| Model | Best For | Speed | Cost |
-|-------|----------|-------|------|
-| Claude 3 Opus | Complex reasoning | Slow | $$$ |
-| Claude 3 Sonnet | Balanced | Medium | $$ |
-| Claude 3 Haiku | Speed & cost | Fast | $ |
+This is the single most common stumbling block, so it's worth being precise.
 
-## What are Bedrock Agents?
+A **foundation model** has an ID like `anthropic.claude-opus-5`. An **inference profile** has an ID like `us.anthropic.claude-opus-5` and routes your request to that model in one of several Regions.
 
-Bedrock Agents orchestrate multi-step tasks using:
-- **Foundation models** for intelligence
-- **Knowledge bases** for RAG
-- **Action groups** for custom tools
-- **Guardrails** for safety
+**Every current Claude model on Bedrock is inference-profile only.** None of them support direct `ON_DEMAND` invocation. Check for yourself:
 
-### Agent Workflow
-
-```
-User Query → Agent Planning → Knowledge Retrieval
-                ↓
-          Tool Execution
-                ↓
-          Response Generation
+```bash
+aws bedrock list-foundation-models --region us-east-1 --by-provider anthropic \
+  --query 'modelSummaries[?modelLifecycle.status==`ACTIVE`].[modelId,join(`,`,inferenceTypesSupported)]' \
+  --output table
 ```
 
-## What are Bedrock Agents?
+Everything returned says `INFERENCE_PROFILE`. This affects two things:
 
-**Bedrock Agents** provide an API for:
-- Agent responses with knowledge base integration
-- Multi-turn conversations
-- Citations and source tracking
-- Trace visibility
+1. **The model ID you configure** must carry the Region prefix.
+2. **Your IAM policy** must allow `bedrock:InvokeModel` on both the profile ARN *and* the underlying foundation model ARN - see [ARCHITECTURE.md](../ARCHITECTURE.md#iam-and-why-inference-profiles-complicate-it).
 
-### Why Bedrock Agents?
+## What is vector search?
 
-Bedrock Agents simplify RAG system development:
-- **Easy Integration**: Connect agents directly to knowledge bases
-- **Managed Orchestration**: Agent handles retrieval and response generation
-- **Debugging**: Access to agent's reasoning trace
-- **Conversations**: Maintain context across turns
+### How it works
 
-## What is Vector Search?
+An embedding model maps text to a point in high-dimensional space - 1024 dimensions for Titan V2 - positioned so that **text with similar meaning lands close together**. Not similar *spelling*: similar *meaning*.
 
-Vector search finds similar content using embeddings.
-
-### How it Works
-
-1. **Embedding**: Text → Vector
-   ```
-   "Hello world" → [0.1, 0.3, -0.2, ...]
-   ```
-
-2. **Similarity**: Compare vectors using cosine similarity
-   ```
-   similarity(v1, v2) = (v1 · v2) / (|v1| × |v2|)
-   ```
-
-3. **Retrieval**: Return most similar chunks
+Similarity is measured with cosine distance, the angle between two vectors. Searching means embedding the question and finding the nearest stored chunks.
 
 ### Example
 
-```
-Query: "How do I deploy?"
-Embeddings:
-  "Deployment guide..." → 0.92 similarity ✓
-  "API reference..."    → 0.45 similarity
-  "Pricing info..."     → 0.12 similarity
-```
-
-## Architecture Overview
-
-Our tutorial stack includes:
+Three chunks, embedded:
 
 ```
-┌─────────────────────────────────────────────┐
-│                S3 Bucket                     │
-│  ├── getting-started.md                     │
-│  ├── api-reference.md                       │
-│  └── customization-guide.md                 │
-└──────────────┬──────────────────────────────┘
-               │
-               v
-┌─────────────────────────────────────────────┐
-│         Bedrock Knowledge Base               │
-│  ├── Embedding: Titan v2                    │
-│  ├── Chunking: Fixed 300 tokens             │
-│  └── Storage: OpenSearch Serverless         │
-└──────────────┬──────────────────────────────┘
-               │
-               v
-┌─────────────────────────────────────────────┐
-│      OpenSearch Serverless Collection       │
-│  ├── Vector Index                           │
-│  ├── HNSW Algorithm                         │
-│  └── Automatic Scaling                      │
-└──────────────┬──────────────────────────────┘
-               │
-               v
-┌─────────────────────────────────────────────┐
-│           Bedrock Agent                      │
-│  ├── Model: Claude 3 Sonnet                 │
-│  ├── Instructions: Custom prompt            │
-│  └── API: Agent responses                   │
-└─────────────────────────────────────────────┘
+"Employees receive 20 days of paid time off"      → [0.21, -0.44, 0.09, ...]
+"Our PTO allowance is four weeks annually"        → [0.19, -0.41, 0.11, ...]   ← very close
+"The Q4 gross margin improved to 71%"             → [-0.62, 0.30, -0.55, ...]  ← far away
 ```
 
-## Key Concepts
+Ask *"how much vacation do I get?"* and it embeds near the first two, even though it shares almost no words with either. That's why vector search beats keyword search for question answering.
 
-### Document Chunking
+## Why S3 Vectors
 
-Breaking documents into smaller pieces:
+Bedrock Knowledge Bases support several vector stores: OpenSearch Serverless, OpenSearch Managed, Pinecone, Aurora RDS, Neptune Analytics, MongoDB Atlas, and **S3 Vectors**.
 
-```
-Original Doc (1000 words)
-    ↓
-Chunks (300 tokens each)
-    ├── Chunk 1: "Introduction to RAG..."
-    ├── Chunk 2: "RAG uses embeddings..."
-    └── Chunk 3: "Benefits of RAG..."
-```
+| | S3 Vectors | OpenSearch Serverless |
+|---|---|---|
+| Billing model | Per request + per GB stored | Provisioned capacity units, always on |
+| Idle cost | Effectively zero | Meaningful - it never scales to zero |
+| Creation time | Under a minute | 15-20 minutes |
+| Latency | Higher | Lower |
+| Best for | Document Q&A, cost-sensitive workloads | High-QPS, latency-sensitive search |
 
-**Why?** Embeddings work better on focused text.
+For a knowledge base of a few dozen documents queried occasionally, S3 Vectors is dramatically cheaper - AWS cites up to 90% savings - and that is exactly this tutorial's shape.
+
+> **S3 Vectors is generally available** and has native CloudFormation support (`AWS::S3Vectors::VectorBucket`, `AWS::S3Vectors::Index`). Earlier versions of this tutorial predated that and used a community CDK library plus manual console steps; that is no longer necessary.
+
+## Key concepts
+
+### Document chunking
+
+Documents are split before embedding, for two reasons: embedding models have input limits, and retrieving a whole 40-page handbook to answer one question wastes context and dilutes relevance.
+
+This tutorial uses `FIXED_SIZE` chunking at **300 tokens** with **7% overlap**.
+
+**Overlap matters.** Without it, a sentence spanning a chunk boundary is split across two chunks and may be retrievable from neither. Overlap duplicates a little text at each boundary so the sentence survives intact in at least one chunk.
+
+Trade-offs:
+
+| Chunk size | Effect |
+|---|---|
+| Small (100-300 tokens) | Precise retrieval, but may lack surrounding context |
+| Medium (300-800) | Good default balance |
+| Large (800-2000) | Rich context, but noisier retrieval and more tokens per query |
 
 ### Embeddings
 
-Vector representations of text:
+Titan Text Embeddings V2 supports 256, 512, or 1024 dimensions. This tutorial uses 1024.
 
-```
-Text: "Amazon Bedrock is a managed service"
-  ↓
-Embedding Model
-  ↓
-Vector: [0.12, -0.34, 0.56, ..., 0.89]
-         └─ 1024 or 1536 dimensions ─┘
-```
+**The embedding dimension and the vector index dimension must match.** They are configured in two places in [lib/s3-rag-stack.ts](../lib/s3-rag-stack.ts) and [lib/knowledge-base-construct.ts](../lib/knowledge-base-construct.ts) - change them together, and re-create the index if you change it after deploying (dimension is a create-only property).
 
-**Properties:**
-- Similar text → Similar vectors
-- Mathematical operations
-- Language-agnostic
+More dimensions means better semantic fidelity and more storage. 1024 is the sensible default.
 
-### Prompt Engineering
+### Prompt engineering
 
-Crafting instructions for the agent:
+The retrieved chunks don't go to the model raw. They're inserted into a prompt template that tells the model how to behave. This tutorial's template lives in `PROMPT_TEMPLATE` in [lib/s3-rag-stack.ts](../lib/s3-rag-stack.ts).
 
-```typescript
-instruction: `You are a helpful assistant.
+A template **must** contain the `$search_results$` placeholder, which Bedrock replaces with the retrieved chunks. Omit it and the model gets no context at all.
 
-Your capabilities:
-- Search knowledge base
-- Provide accurate answers
-- Cite sources
+Good templates instruct the model to:
+- Answer only from the supplied results
+- Say so plainly when the results don't contain the answer
+- Cite which document each claim came from
 
-Your constraints:
-- Don't make up information
-- Admit when you don't know
-- Stay on topic
-`
-```
+### Session management
 
-### Session Management
+`RetrieveAndGenerate` can hold conversation history server-side, so follow-up questions like *"and what about dental?"* resolve against the previous turn.
 
-Maintaining conversation context:
+The mechanic that trips people up: **Bedrock issues the session ID, not you.** The first request in a conversation omits `sessionId`; the response contains one; subsequent requests send it back. A client-invented ID is rejected.
 
-```
-Session: user-123-conv-456
-  ├── Turn 1: "What is RAG?"
-  ├── Turn 2: "How does it work?"
-  └── Turn 3: "Show me an example"
-```
+## Cost breakdown
 
-## Cost Breakdown
+Light usage (a few hundred queries while working through the tutorial):
 
-### Monthly Estimate (light usage)
+| Item | Rough cost |
+|---|---|
+| S3 document storage | Pennies |
+| S3 Vectors storage + requests | Pennies |
+| Titan embeddings (ingestion) | Pennies - a one-off for ~17 documents |
+| Claude generation | The dominant cost; varies by model and query count |
+| Lambda, API Gateway, CloudFront | Free tier |
 
-| Service | Usage | Cost |
-|---------|-------|------|
-| S3 | 1 GB storage | $0.02 |
-| OpenSearch | 1 OCU × 730 hrs | $175 |
-| Bedrock KB | 10K queries | $0.10 |
-| Bedrock Agent | 100K tokens | $3.00 |
-| **Total** | | **~$178** |
+**Total: roughly $1-5.** Using `us.anthropic.claude-haiku-4-5-20251001-v1:0` instead of Opus 5 cuts the dominant line item substantially.
 
-**Cost Optimization:**
-- Use smaller embedding models
-- Reduce chunk overlap
-- Implement caching
-- Use Haiku for simple queries
+## Use cases
 
-## Use Cases
+The same architecture supports:
 
-### 1. Customer Support
-- Answer FAQs from documentation
-- Escalate complex issues
-- Provide consistent responses
+1. **Customer support** - answer from product docs and past tickets, with citations
+2. **Internal knowledge base** - policies, handbooks, runbooks
+3. **Research assistant** - query a corpus of papers or reports
+4. **Product documentation** - conversational docs search
 
-### 2. Internal Knowledge Base
-- Search company policies
-- Find technical documentation
-- Onboard new employees
+## Prerequisites check
 
-### 3. Research Assistant
-- Query academic papers
-- Summarize findings
-- Cite sources
+### Enable Bedrock model access
 
-### 4. Product Documentation
-- Interactive user guides
-- API documentation search
-- Troubleshooting help
+Bedrock grants most models automatically, but some need a one-time use-case submission. In the Bedrock console, open **Model access** and confirm your chosen model is enabled.
 
-## Prerequisites Check
-
-Before proceeding, ensure you have:
-
-- [ ] AWS Account with admin access
-- [ ] Bedrock access enabled in your region
-- [ ] Node.js 18+ installed
-- [ ] AWS CLI configured
-- [ ] CDK CLI installed: `npm install -g aws-cdk`
-- [ ] Basic TypeScript knowledge
-- [ ] Understanding of AWS IAM
-
-### Enable Bedrock Access
-
-1. Go to AWS Console → Bedrock
-2. Navigate to "Model access"
-3. Enable models:
-   - Anthropic Claude 3 Sonnet
-   - Amazon Titan Embeddings v2
-4. Wait for "Access granted" status
-
-### Verify Prerequisites
+Verify from the CLI:
 
 ```bash
-# Check Node.js
-node --version  # Should be v18 or higher
+aws bedrock list-inference-profiles --region us-east-1 \
+  --query "inferenceProfileSummaries[?contains(inferenceProfileId, 'claude')].[inferenceProfileId,status]" \
+  --output table
+```
 
-# Check AWS CLI
+### Verify tooling
+
+```bash
+node --version      # 20+
 aws --version
-
-# Check CDK
-cdk --version
-
-# Verify AWS credentials
+cdk --version       # npm install -g aws-cdk
+docker info         # must be running - CDK bundles the Lambda in a container
+jq --version
 aws sts get-caller-identity
 ```
 
-## Next Steps
+## Next steps
 
-Now that you understand the fundamentals, let's set up the infrastructure!
+→ **[Step 2: Setting Up Infrastructure](02-infrastructure.md)** - walk through the CDK stack and deploy it.
 
-→ Continue to [Step 2: Setting Up Infrastructure](02-infrastructure.md)
+## Additional resources
 
-## Additional Resources
-
-- [RAG Overview (AWS)](https://aws.amazon.com/what-is/retrieval-augmented-generation/)
-- [Bedrock Documentation](https://docs.aws.amazon.com/bedrock/)
-- [Vector Databases Explained](https://www.pinecone.io/learn/vector-database/)
-- [Prompt Engineering Guide](https://www.promptingguide.ai/)
+- [Amazon Bedrock Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html)
+- [Amazon S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html)
+- [Supported Regions and models for inference profiles](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html)
+- [RetrieveAndGenerate API reference](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_agent-runtime_RetrieveAndGenerate.html)

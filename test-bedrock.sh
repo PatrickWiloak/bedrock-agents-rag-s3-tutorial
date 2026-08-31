@@ -1,216 +1,170 @@
 #!/bin/bash
 
-# Bedrock Agent Test Script with Enhanced Logging
-# Tests agent invocation and shows detailed permission/error information
+# RAG diagnostic script.
+#
+# Walks the deployment from the bottom up and stops at the first thing that is
+# actually broken, so you get a specific cause instead of a generic
+# AccessDeniedException from the web UI.
+#
+#   ./test-bedrock.sh
 
-set -e
+set -uo pipefail
+
+STACK_NAME="S3VectorRAGStack"
+REGION="${AWS_REGION:-us-east-1}"
+
+pass() { echo "  ✓ $1"; }
+fail() { echo "  ✗ $1"; }
+info() { echo "  · $1"; }
 
 echo "╔════════════════════════════════════════════════════════════════╗"
-echo "║          Bedrock Agent Test - Enhanced Logging                ║"
+echo "║              Bedrock RAG Diagnostic                            ║"
 echo "╚════════════════════════════════════════════════════════════════╝"
 echo ""
 
-# Get AWS account and region
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION="us-east-1"
-
-echo "▶ AWS Configuration"
-echo "  Account: $ACCOUNT_ID"
-echo "  Region: $REGION"
+# ---------------------------------------------------------------------------
+# 1. Credentials
+# ---------------------------------------------------------------------------
+echo "▶ AWS credentials"
+if ! IDENTITY=$(aws sts get-caller-identity --output json 2>&1); then
+  fail "No usable AWS credentials"
+  echo "$IDENTITY" | sed 's/^/    /'
+  exit 1
+fi
+ACCOUNT_ID=$(echo "$IDENTITY" | jq -r .Account)
+pass "Account: $ACCOUNT_ID"
+pass "Region:  $REGION"
 echo ""
 
-# Get agent ID from CloudFormation outputs
-echo "▶ Fetching Agent ID from CloudFormation..."
-AGENT_ID=$(aws cloudformation describe-stacks \
-  --stack-name S3VectorRAGStack \
-  --region "$REGION" \
-  --query "Stacks[0].Outputs[?contains(OutputKey, 'AgentIdOutput')].OutputValue" \
-  --output text 2>/dev/null || echo "")
-
-if [ -z "$AGENT_ID" ]; then
-  echo "  ✗ ERROR: Could not find Agent ID in CloudFormation outputs"
-  echo ""
-  echo "  Stack outputs:"
-  aws cloudformation describe-stacks \
-    --stack-name S3VectorRAGStack \
-    --region "$REGION" \
-    --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" \
-    --output table 2>/dev/null || echo "  Stack not found"
+# ---------------------------------------------------------------------------
+# 2. Stack outputs
+# ---------------------------------------------------------------------------
+echo "▶ CloudFormation stack"
+if ! OUTPUTS=$(aws cloudformation describe-stacks \
+  --stack-name "$STACK_NAME" --region "$REGION" \
+  --query 'Stacks[0].Outputs' --output json 2>&1); then
+  fail "Stack '$STACK_NAME' not found in $REGION"
+  info "Deploy it first: ./deploy.sh"
   exit 1
 fi
 
-echo "  ✓ Agent ID: $AGENT_ID"
-echo ""
-
-# Check agent status
-echo "▶ Checking Agent Status..."
-AGENT_STATUS=$(aws bedrock-agent get-agent \
-  --agent-id "$AGENT_ID" \
-  --region "$REGION" \
-  --query 'agent.[agentStatus,agentName,foundationModel]' \
-  --output json 2>&1)
-
-if [ $? -eq 0 ]; then
-  echo "$AGENT_STATUS" | jq -r '. | "  Status: \(.[0])\n  Name: \(.[1])\n  Model: \(.[2])"'
-else
-  echo "  ✗ ERROR getting agent status:"
-  echo "$AGENT_STATUS" | grep -i "error\|denied\|exception" || echo "$AGENT_STATUS"
-  exit 1
-fi
-echo ""
-
-# Check IAM permissions
-echo "▶ Checking IAM Permissions..."
-CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
-echo "  Caller: $CALLER_ARN"
-
-# Test InvokeAgent permission
-echo "  Testing bedrock-agent:InvokeAgent permission..."
-TEST_INVOKE=$(aws bedrock-agent-runtime invoke-agent \
-  --agent-id "$AGENT_ID" \
-  --agent-alias-id "TSTALIASID" \
-  --session-id "test-permissions-$(date +%s)" \
-  --input-text "test" \
-  --region "$REGION" \
-  /tmp/test-output.txt 2>&1)
-
-if [ $? -eq 0 ]; then
-  echo "  ✓ InvokeAgent permission: OK"
-else
-  if echo "$TEST_INVOKE" | grep -iq "AccessDeniedException\|not authorized"; then
-    echo "  ✗ InvokeAgent permission: DENIED"
-    echo ""
-    echo "  Full error:"
-    echo "$TEST_INVOKE"
-    echo ""
-    echo "  Required IAM policy:"
-    cat << 'EOF'
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": [
-          "bedrock-agent:InvokeAgent",
-          "bedrock-agent-runtime:InvokeAgent"
-        ],
-        "Resource": "*"
-      }
-    ]
-  }
-EOF
-    exit 1
-  else
-    echo "  ? Permission check inconclusive"
-    echo "  Error: $TEST_INVOKE"
-  fi
-fi
-echo ""
-
-# Run actual test
-echo "▶ Testing Agent with Question..."
-SESSION_ID="test-session-$(date +%s)"
-QUESTION="What are the company's PTO benefits?"
-
-echo "  Question: $QUESTION"
-echo "  Session: $SESSION_ID"
-echo ""
-
-echo "  Invoking agent (this may take 10-30 seconds)..."
-echo ""
-
-# Invoke agent and capture output
-OUTPUT_FILE="/tmp/bedrock-agent-response-$(date +%s).txt"
-ERROR_LOG="/tmp/bedrock-agent-error-$(date +%s).txt"
-
-aws bedrock-agent-runtime invoke-agent \
-  --agent-id "$AGENT_ID" \
-  --agent-alias-id "TSTALIASID" \
-  --session-id "$SESSION_ID" \
-  --input-text "$QUESTION" \
-  --region "$REGION" \
-  "$OUTPUT_FILE" 2>"$ERROR_LOG"
-
-INVOKE_STATUS=$?
-
-echo "═══════════════════════════════════════════════════════════════"
-echo "                           RESULTS"
-echo "═══════════════════════════════════════════════════════════════"
-echo ""
-
-if [ $INVOKE_STATUS -eq 0 ]; then
-  echo "✓ SUCCESS - Agent responded"
-  echo ""
-
-  # Parse response
-  if [ -f "$OUTPUT_FILE" ]; then
-    RESPONSE=$(cat "$OUTPUT_FILE")
-    echo "Response:"
-    echo "─────────────────────────────────────────────────────────────"
-    echo "$RESPONSE"
-    echo "─────────────────────────────────────────────────────────────"
-    echo ""
-    echo "Response length: $(echo "$RESPONSE" | wc -c) characters"
-  fi
-else
-  echo "✗ FAILED - Agent invocation failed"
-  echo ""
-
-  # Show error details
-  if [ -f "$ERROR_LOG" ] && [ -s "$ERROR_LOG" ]; then
-    echo "Error details:"
-    echo "─────────────────────────────────────────────────────────────"
-    cat "$ERROR_LOG"
-    echo "─────────────────────────────────────────────────────────────"
-    echo ""
-
-    # Check for common errors
-    ERROR_CONTENT=$(cat "$ERROR_LOG")
-
-    if echo "$ERROR_CONTENT" | grep -iq "AccessDeniedException"; then
-      echo "🔒 Permission Issue Detected"
-      echo ""
-      echo "The IAM user/role lacks permission to invoke the agent."
-      echo ""
-      echo "Add this policy to your IAM user/role:"
-      cat << 'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "bedrock-agent:InvokeAgent",
-        "bedrock-agent-runtime:InvokeAgent"
-      ],
-      "Resource": "*"
-    }
-  ]
+get_output() {
+  echo "$OUTPUTS" | jq -r --arg k "$1" '.[] | select(.OutputKey==$k) | .OutputValue'
 }
-EOF
-    elif echo "$ERROR_CONTENT" | grep -iq "ResourceNotFoundException"; then
-      echo "🔍 Agent Not Found"
-      echo ""
-      echo "The agent or alias doesn't exist. Check:"
-      echo "  - Agent ID: $AGENT_ID"
-      echo "  - Alias ID: TSTALIASID"
-      echo "  - Agent status must be PREPARED or DRAFT"
-    elif echo "$ERROR_CONTENT" | grep -iq "ValidationException"; then
-      echo "⚠️  Validation Error"
-      echo ""
-      echo "The request parameters are invalid. Check:"
-      echo "  - Agent must be in PREPARED or DRAFT status"
-      echo "  - Alias must exist (TSTALIASID is automatic for DRAFT agents)"
-    fi
-  fi
 
+KB_ID=$(get_output KnowledgeBaseIdOutput)
+DS_ID=$(get_output DataSourceIdOutput)
+MODEL_ID=$(get_output ModelId)
+API_ENDPOINT=$(get_output ApiEndpoint)
+
+if [ -z "$KB_ID" ]; then
+  fail "KnowledgeBaseIdOutput missing from stack outputs"
   exit 1
 fi
+pass "Knowledge Base: $KB_ID"
+pass "Data Source:    $DS_ID"
+pass "Model:          $MODEL_ID"
+echo ""
 
+# ---------------------------------------------------------------------------
+# 3. Model access
+#
+# The most common failure in this tutorial: the model exists, but the account
+# has never enabled access to it in the Bedrock console.
+# ---------------------------------------------------------------------------
+echo "▶ Model access"
+PROFILE_STATUS=$(aws bedrock list-inference-profiles --region "$REGION" \
+  --query "inferenceProfileSummaries[?inferenceProfileId=='${MODEL_ID}'].status" \
+  --output text 2>/dev/null)
+
+if [ -z "$PROFILE_STATUS" ]; then
+  fail "Inference profile '$MODEL_ID' is not available in $REGION"
+  info "List what is: aws bedrock list-inference-profiles --region $REGION"
+else
+  pass "Inference profile status: $PROFILE_STATUS"
+fi
 echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "Test completed successfully!"
+
+# ---------------------------------------------------------------------------
+# 4. Knowledge base state
+# ---------------------------------------------------------------------------
+echo "▶ Knowledge base"
+if ! KB_JSON=$(aws bedrock-agent get-knowledge-base \
+  --knowledge-base-id "$KB_ID" --region "$REGION" --output json 2>&1); then
+  fail "Cannot read the knowledge base"
+  echo "$KB_JSON" | sed 's/^/    /'
+  exit 1
+fi
+KB_STATUS=$(echo "$KB_JSON" | jq -r .knowledgeBase.status)
+KB_STORE=$(echo "$KB_JSON" | jq -r .knowledgeBase.storageConfiguration.type)
+if [ "$KB_STATUS" = "ACTIVE" ]; then
+  pass "Status: $KB_STATUS (storage: $KB_STORE)"
+else
+  fail "Status: $KB_STATUS"
+  echo "$KB_JSON" | jq -r '.knowledgeBase.failureReasons[]?' | sed 's/^/    /'
+fi
 echo ""
-echo "To view CloudWatch logs:"
-echo "  aws logs tail /aws/lambda/S3VectorRAGStack-WebHostingBedrockApiFunction --follow"
+
+# ---------------------------------------------------------------------------
+# 5. Ingestion
+# ---------------------------------------------------------------------------
+echo "▶ Ingestion"
+JOB=$(aws bedrock-agent list-ingestion-jobs \
+  --knowledge-base-id "$KB_ID" --data-source-id "$DS_ID" \
+  --region "$REGION" --max-results 1 \
+  --query 'ingestionJobSummaries[0]' --output json 2>/dev/null)
+
+if [ -z "$JOB" ] || [ "$JOB" = "null" ]; then
+  fail "No ingestion job has ever run"
+  info "Upload and ingest documents: npm run upload-docs"
+else
+  JOB_STATUS=$(echo "$JOB" | jq -r .status)
+  INDEXED=$(echo "$JOB" | jq -r '.statistics.numberOfModifiedDocumentsIndexed // 0')
+  FAILED=$(echo "$JOB" | jq -r '.statistics.numberOfDocumentsFailed // 0')
+  if [ "$JOB_STATUS" = "COMPLETE" ]; then
+    pass "Latest job: $JOB_STATUS ($INDEXED indexed, $FAILED failed)"
+  else
+    fail "Latest job: $JOB_STATUS ($INDEXED indexed, $FAILED failed)"
+    info "Details: npm run check-status"
+  fi
+fi
 echo ""
+
+# ---------------------------------------------------------------------------
+# 6. End-to-end query
+#
+# This one costs a few cents - it actually runs retrieval and generation.
+# ---------------------------------------------------------------------------
+echo "▶ End-to-end query (this invokes the model)"
+QUESTION="What is the remote work policy?"
+info "Asking: $QUESTION"
+
+RESULT=$(aws bedrock-agent-runtime retrieve-and-generate \
+  --region "$REGION" \
+  --input "{\"text\":\"${QUESTION}\"}" \
+  --retrieve-and-generate-configuration "{
+    \"type\": \"KNOWLEDGE_BASE\",
+    \"knowledgeBaseConfiguration\": {
+      \"knowledgeBaseId\": \"${KB_ID}\",
+      \"modelArn\": \"arn:aws:bedrock:${REGION}:${ACCOUNT_ID}:inference-profile/${MODEL_ID}\"
+    }
+  }" --output json 2>&1)
+
+if echo "$RESULT" | jq -e .output.text >/dev/null 2>&1; then
+  pass "Got an answer:"
+  echo "$RESULT" | jq -r .output.text | head -5 | sed 's/^/    /'
+  CITES=$(echo "$RESULT" | jq '[.citations[].retrievedReferences[]?] | length')
+  pass "Citations: $CITES"
+else
+  fail "Query failed"
+  echo "$RESULT" | sed 's/^/    /'
+  echo ""
+  info "AccessDeniedException on the model usually means model access is not"
+  info "enabled for this account. Enable it in the Bedrock console under"
+  info "'Model access', then retry."
+  exit 1
+fi
+echo ""
+
+[ -n "$API_ENDPOINT" ] && info "Web API: ${API_ENDPOINT}chat"
+echo "✅ All checks passed."

@@ -163,7 +163,7 @@ async function main() {
     console.log('\nNext steps:');
     console.log('1. Wait for ingestion job to complete (usually 2-5 minutes)');
     console.log('   Run "npm run check-status" to monitor progress');
-    console.log('2. Once complete, run "npm run test-agent" to test your agent');
+    console.log('2. Once complete, run "npm run test-rag" to query your knowledge base');
     console.log('3. Add your own documents to the appropriate folders and re-run ingestion');
     console.log('\nKnowledge Base Folders:');
     console.log('  • Financial-Data/     - Financial reports, budgets, policies');

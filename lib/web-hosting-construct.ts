@@ -11,28 +11,58 @@ import * as path from 'path';
 
 export interface WebHostingConstructProps {
   /**
-   * The Bedrock Agent ID
+   * The Bedrock Knowledge Base to answer questions from
    */
-  agentId: string;
+  knowledgeBaseId: string;
 
   /**
-   * The Bedrock Agent Alias ID (optional)
-   *
-   * AWS Bedrock agents require an alias for invocation. If not provided,
-   * this construct will use 'TSTALIASID', which is AWS's built-in test
-   * alias that automatically exists for all DRAFT agents.
-   *
-   * @default 'TSTALIASID' - Built-in test alias for DRAFT agents
-   *
-   * @see https://docs.aws.amazon.com/bedrock/latest/userguide/agents-deploy.html
+   * ARN of the knowledge base, used to scope the Lambda's IAM policy
    */
-  agentAliasId?: string;
+  knowledgeBaseArn: string;
+
+  /**
+   * The model that generates answers from retrieved chunks.
+   *
+   * Every current Claude model on Bedrock is served through a cross-Region
+   * inference profile, so this is a profile ID such as
+   * `us.anthropic.claude-opus-5` rather than a bare foundation model ID.
+   */
+  modelId: string;
+
+  /**
+   * Number of chunks to retrieve per question
+   * @default 5
+   */
+  numberOfResults?: number;
+
+  /**
+   * Prompt template controlling how answers are written.
+   *
+   * This is the RetrieveAndGenerate equivalent of an agent's instructions. It
+   * must contain the `$search_results$` placeholder. Omit it to use Bedrock's
+   * built-in template.
+   */
+  promptTemplate?: string;
 
   /**
    * Path to the built Next.js static export
    * @default '../web/out'
    */
   webBuildPath?: string;
+}
+
+/**
+ * Strips the cross-Region routing prefix off an inference profile ID.
+ *
+ * `us.anthropic.claude-opus-5` -> `anthropic.claude-opus-5`
+ *
+ * An inference profile routes to the same foundation model in several Regions,
+ * and `bedrock:InvokeModel` is authorized against the underlying foundation
+ * model in whichever Region serves the request - so the policy needs the base
+ * model ID as well as the profile.
+ */
+function baseModelIdOf(modelId: string): string {
+  return modelId.replace(/^(us|eu|apac|global)\./, '');
 }
 
 export class WebHostingConstruct extends Construct {
@@ -46,93 +76,69 @@ export class WebHostingConstruct extends Construct {
     super(scope, id);
 
     const webBuildPath = props.webBuildPath || path.join(__dirname, '../web/out');
+    const stack = cdk.Stack.of(this);
+
+    const modelArn = `arn:aws:bedrock:${stack.region}:${stack.account}:inference-profile/${props.modelId}`;
+    const baseModelArn = `arn:aws:bedrock:*::foundation-model/${baseModelIdOf(props.modelId)}`;
 
     // ========================================
-    // 1. Create Lambda function for Bedrock API
+    // 1. Lambda function backing the chat API
     // ========================================
 
-    /**
-     * Bedrock API Lambda Function
-     *
-     * This Lambda handles chat requests from the frontend and invokes the Bedrock Agent.
-     *
-     * Code location: lambda/ folder contains JavaScript files (.js)
-     * - bedrock-api.js is already compiled JavaScript (not TypeScript)
-     * - We bundle it with dependencies during CDK deployment
-     *
-     * Bundling: Installs node_modules and packages everything together
-     * so the Lambda has all required AWS SDK dependencies.
-     */
-    const bedrockApiLambda = new lambda.Function(this, 'BedrockApiFunction', {
-      runtime: lambda.Runtime.NODEJS_20_X,
+    const ragApiLambda = new lambda.Function(this, 'BedrockApiFunction', {
+      runtime: lambda.Runtime.NODEJS_22_X,
       handler: 'bedrock-api.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda'), {
         bundling: {
-          image: lambda.Runtime.NODEJS_20_X.bundlingImage,
+          image: lambda.Runtime.NODEJS_22_X.bundlingImage,
           command: [
             'bash',
             '-c',
-            'npm install --production && cp -r /asset-input/* /asset-output/',
+            'npm install --omit=dev --cache /tmp/npm-cache && cp -r /asset-input/* /asset-output/',
           ],
         },
       }),
-      timeout: cdk.Duration.seconds(30),
+      timeout: cdk.Duration.seconds(60),
       memorySize: 512,
       environment: {
-        AGENT_ID: props.agentId,
-        /**
-         * AGENT_ALIAS_ID: AWS Bedrock requires an alias ID to invoke agents
-         *
-         * We use 'TSTALIASID' as the default fallback, which is AWS's built-in
-         * test alias that automatically exists for every DRAFT agent. This means:
-         * - No need to manually create an alias during development
-         * - The agent is immediately invokable after deployment
-         * - Perfect for tutorials and testing
-         *
-         * For production deployments, you can create a custom alias via the
-         * Bedrock console or add alias creation to your CDK stack.
-         */
-        AGENT_ALIAS_ID: props.agentAliasId || 'TSTALIASID',
+        KNOWLEDGE_BASE_ID: props.knowledgeBaseId,
+        MODEL_ARN: modelArn,
+        NUMBER_OF_RESULTS: String(props.numberOfResults ?? 5),
+        ...(props.promptTemplate ? { PROMPT_TEMPLATE: props.promptTemplate } : {}),
       },
     });
 
-    // Grant Lambda permissions to invoke Bedrock Agent
-    bedrockApiLambda.addToRolePolicy(
+    // Retrieve is scoped to this one knowledge base.
+    ragApiLambda.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          'bedrock:InvokeAgent',
-          'bedrock-agent:InvokeAgent',
-          'bedrock:InvokeModel',
-        ],
-        resources: ['*'],
+        actions: ['bedrock:Retrieve', 'bedrock:RetrieveAndGenerate'],
+        resources: [props.knowledgeBaseArn],
+      })
+    );
+
+    // Generation runs through the inference profile, which in turn invokes the
+    // foundation model in one of the Regions the profile spans.
+    ragApiLambda.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['bedrock:InvokeModel'],
+        resources: [modelArn, baseModelArn],
       })
     );
 
     // ========================================
-    // 2. Create API Gateway REST API
+    // 2. API Gateway REST API
     // ========================================
 
     const api = new apigateway.RestApi(this, 'BedrockApi', {
-      restApiName: 'Bedrock Agent API',
-      description: 'API Gateway for Bedrock Agent invocations',
+      restApiName: 'Bedrock RAG API',
+      description: 'API Gateway for Bedrock Knowledge Base queries',
       deployOptions: {
         stageName: 'prod',
         throttlingRateLimit: 100,
         throttlingBurstLimit: 200,
       },
-      /**
-       * CORS Configuration for API Gateway
-       *
-       * This handles preflight OPTIONS requests from the browser.
-       * The actual POST/GET responses must include CORS headers from Lambda.
-       *
-       * Settings:
-       * - allowOrigins: ALL_ORIGINS allows CloudFront (or any domain) to call the API
-       *   For production, replace with specific CloudFront domain
-       * - allowMethods: Only POST and OPTIONS (tighten security)
-       * - allowHeaders: Standard headers for JSON API calls
-       */
       defaultCorsPreflightOptions: {
         allowOrigins: apigateway.Cors.ALL_ORIGINS,
         allowMethods: ['POST', 'OPTIONS'],
@@ -146,54 +152,38 @@ export class WebHostingConstruct extends Construct {
       },
     });
 
-    // Add /chat endpoint
     const chat = api.root.addResource('chat');
-    chat.addMethod(
-      'POST',
-      new apigateway.LambdaIntegration(bedrockApiLambda, {
-        proxy: true,
-      })
-    );
+    chat.addMethod('POST', new apigateway.LambdaIntegration(ragApiLambda, { proxy: true }));
 
     this.apiEndpoint = api.url;
 
     // ========================================
-    // 3. Create S3 bucket for static website
+    // 3. S3 bucket for the static site
     // ========================================
 
     this.websiteBucket = new s3.Bucket(this, 'WebsiteBucket', {
-      bucketName: `rag-tutorial-web-${cdk.Stack.of(this).account}-${cdk.Stack.of(this).region}`,
-      // DON'T set websiteIndexDocument/websiteErrorDocument - those create a website endpoint
-      // which conflicts with OAI. We handle routing via CloudFront error responses instead.
-      publicReadAccess: false, // CloudFront will access via OAI
+      // No websiteIndexDocument here - that would create an S3 website endpoint,
+      // which cannot be locked down to CloudFront. Routing is handled by the
+      // CloudFront error responses below instead.
+      publicReadAccess: false,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+      encryption: s3.BucketEncryption.S3_MANAGED,
+      enforceSSL: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });
 
     // ========================================
-    // 4. Create CloudFront Distribution
+    // 4. CloudFront distribution
     // ========================================
 
-    // Origin Access Identity for S3
-    const originAccessIdentity = new cloudfront.OriginAccessIdentity(
-      this,
-      'WebsiteOAI',
-      {
-        comment: 'OAI for RAG Tutorial Website',
-      }
-    );
-
-    // Grant CloudFront read access to S3 bucket
-    this.websiteBucket.grantRead(originAccessIdentity);
-
-    // CloudFront distribution
     this.distribution = new cloudfront.Distribution(this, 'WebsiteDistribution', {
       defaultRootObject: 'index.html',
       defaultBehavior: {
-        origin: new origins.S3Origin(this.websiteBucket, {
-          originAccessIdentity,
-        }),
+        // Origin Access Control - the current mechanism for private S3 origins.
+        // It supersedes Origin Access Identity and needs no extra construct;
+        // CDK writes the matching bucket policy for us.
+        origin: origins.S3BucketOrigin.withOriginAccessControl(this.websiteBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
@@ -220,27 +210,16 @@ export class WebHostingConstruct extends Construct {
     this.distributionUrl = `https://${this.distributionDomainName}`;
 
     // ========================================
-    // 5. Deploy static files to S3
+    // 5. Deploy the static files
     // ========================================
 
     /**
-     * Deploy website files AND config.json in a single BucketDeployment
+     * The site and its config.json go up in a single BucketDeployment on
+     * purpose. Two separate deployments race each other invalidating the same
+     * distribution, and the config would sometimes lose - leaving the UI live
+     * but pointing at nothing.
      *
-     * IMPORTANT: We combine the Next.js static export and config.json into a
-     * single BucketDeployment to avoid conflicts. Previously, using two separate
-     * BucketDeployments (one for website, one for config) caused issues:
-     * - Both tried to invalidate the same CloudFront distribution simultaneously
-     * - The config.json deployment would sometimes fail silently
-     * - Users would get "config not found" errors in the frontend
-     *
-     * By combining them, we ensure:
-     * - Single atomic deployment operation
-     * - Config.json is always deployed alongside the website
-     * - Single CloudFront invalidation at the end
-     * - More reliable deployments
-     *
-     * The config.json contains the API Gateway endpoint URL, which is injected
-     * at deployment time so the frontend knows where to send API requests.
+     * config.json carries the API Gateway URL, which only exists at deploy time.
      */
     new s3deploy.BucketDeployment(this, 'DeployWebsite', {
       sources: [
@@ -251,7 +230,7 @@ export class WebHostingConstruct extends Construct {
       ],
       destinationBucket: this.websiteBucket,
       distribution: this.distribution,
-      distributionPaths: ['/*'], // Invalidate CloudFront cache
+      distributionPaths: ['/*'],
     });
 
     // ========================================
@@ -261,13 +240,13 @@ export class WebHostingConstruct extends Construct {
     new cdk.CfnOutput(this, 'WebsiteURL', {
       value: this.distributionUrl,
       description: 'CloudFront URL for the web UI',
-      exportName: 'RagTutorialWebsiteURL',
+      exportName: `${stack.stackName}-WebsiteURL`,
     });
 
     new cdk.CfnOutput(this, 'ApiEndpoint', {
       value: this.apiEndpoint,
-      description: 'API Gateway endpoint for Bedrock Agent',
-      exportName: 'RagTutorialApiEndpoint',
+      description: 'API Gateway endpoint for knowledge base queries',
+      exportName: `${stack.stackName}-ApiEndpoint`,
     });
 
     new cdk.CfnOutput(this, 'WebsiteBucketName', {

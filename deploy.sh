@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Complete Deployment Script for S3 RAG Bedrock Agents Tutorial
-# This script handles EVERYTHING from prerequisites to ready-to-use agent
+# Complete Deployment Script for the S3 Vectors RAG Tutorial
+# Handles everything from prerequisites to a queryable knowledge base
 
 set -e  # Exit on error
 
@@ -67,7 +67,7 @@ cat << "EOF"
 ║  ███████║ ██████╔╝     ╚████╔╝ ███████╗ ╚██████╗   ██║   ╚██████╔╝██║  ██║║
 ║  ╚══════╝ ╚═════╝       ╚═══╝  ╚══════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝║
 ║                                                                           ║
-║         RAG with S3 Vectors + Amazon Bedrock Agents                       ║
+║       RAG with S3 Vectors + Bedrock Knowledge Bases                       ║
 ║                   70% Cheaper • 5x Faster • Serverless                    ║
 ║                                                                           ║
 ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -77,17 +77,15 @@ echo -e "${NC}"
 echo -e "${CYAN}${BOLD}One-command deployment. Everything automated.${NC}"
 echo ""
 print_info "Deploys complete RAG system (~10 minutes):"
-echo "  • S3 Vector database + Knowledge Base + Bedrock Agent"
+echo "  • S3 Vector database + Bedrock Knowledge Base"
 echo "  • CloudFront Web UI + API Gateway + Lambda"
-echo "  • 11 sample documents with realistic company data"
+echo "  • 17 sample documents with realistic company data"
 echo ""
 print_warning "Cost: ~\$5/month - DELETE RESOURCES IMMEDIATELY AFTER TESTING"
 echo ""
-echo -e "${YELLOW}⚠️  CLEANUP WARNING:${NC}"
-echo "  • S3 Vectors is still in preview (lacks official CDK support)"
-echo "  • Custom resources may cause cleanup failures"
-echo "  • Use MANUAL cleanup steps in README.md when finished"
-echo "  • See README.md 'Cleanup' section for step-by-step guide"
+echo -e "${YELLOW}⚠️  CLEANUP:${NC}"
+echo "  • Everything is native CloudFormation - 'cdk destroy' removes it all"
+echo "  • Run it as soon as you are done to stop the charges"
 echo ""
 read -p "Press ENTER to begin... " -r
 echo ""
@@ -252,10 +250,9 @@ echo ""
 print_info "All resources will include this ID to avoid naming conflicts"
 echo ""
 print_info "Resource naming examples:"
-echo -e "  ${CYAN}●${NC} Agent:     agent-${ACCOUNT_ID:9}-${DEPLOYMENT_ID}"
 echo -e "  ${CYAN}●${NC} KB:        kb-${ACCOUNT_ID:9}-${DEPLOYMENT_ID}"
 echo -e "  ${CYAN}●${NC} S3 Data:   docs-${ACCOUNT_ID:9}-${REGION}-${DEPLOYMENT_ID}"
-echo -e "  ${CYAN}●${NC} S3 Vector: kb-${ACCOUNT_ID:9}-${DEPLOYMENT_ID}-vectors-${ACCOUNT_ID:9}-${REGION}"
+echo -e "  ${CYAN}●${NC} S3 Vector: kb-${ACCOUNT_ID:9}-${DEPLOYMENT_ID}-vectors"
 echo ""
 print_info "Format: YYMMDD-HHMM (UTC)"
 
@@ -266,7 +263,7 @@ print_info "Stack name: $STACK_NAME"
 echo ""
 print_info "Resources to create:"
 echo -e "  ${CYAN}●${NC} S3 Bucket + S3 Vector Bucket"
-echo -e "  ${CYAN}●${NC} Bedrock Knowledge Base + Agent"
+echo -e "  ${CYAN}●${NC} Bedrock Knowledge Base + Data Source"
 echo -e "  ${CYAN}●${NC} CloudFront + API Gateway + Lambda"
 echo -e "  ${CYAN}●${NC} IAM Roles and Policies"
 echo ""
@@ -290,7 +287,7 @@ else
     echo -e "  ${CYAN}[0-2 min]${NC}   S3 buckets and IAM roles"
     echo -e "  ${CYAN}[2-8 min]${NC}   S3 Vector buckets (serverless!)"
     echo -e "  ${CYAN}[8-12 min]${NC}  Knowledge Bases"
-    echo -e "  ${CYAN}[12-15 min]${NC} Bedrock Agent + Web UI"
+    echo -e "  ${CYAN}[12-15 min]${NC} Web UI (CloudFront + API Gateway)"
     echo ""
 
     cdk deploy --require-approval never --context deploymentId="$DEPLOYMENT_ID"
@@ -315,34 +312,16 @@ BUCKET_NAME=$(aws cloudformation describe-stacks \
     --query 'Stacks[0].Outputs[?OutputKey==`DataBucketName`].OutputValue' \
     --output text)
 
-AGENT_ID=$(aws cloudformation describe-stacks \
+KB_ID=$(aws cloudformation describe-stacks \
     --stack-name $STACK_NAME \
     --region $REGION \
-    --query 'Stacks[0].Outputs[?contains(OutputKey, `AgentIdOutput`)].OutputValue' \
+    --query 'Stacks[0].Outputs[?OutputKey==`KnowledgeBaseIdOutput`].OutputValue' \
     --output text)
 
-AGENT_ALIAS=$(aws cloudformation describe-stacks \
+MODEL_ID=$(aws cloudformation describe-stacks \
     --stack-name $STACK_NAME \
     --region $REGION \
-    --query 'Stacks[0].Outputs[?OutputKey==`AgentAliasIdOutput`].OutputValue' \
-    --output text)
-
-KB_FINANCIAL=$(aws cloudformation describe-stacks \
-    --stack-name $STACK_NAME \
-    --region $REGION \
-    --query 'Stacks[0].Outputs[?OutputKey==`FinancialDataKnowledgeBaseId`].OutputValue' \
-    --output text)
-
-KB_HR=$(aws cloudformation describe-stacks \
-    --stack-name $STACK_NAME \
-    --region $REGION \
-    --query 'Stacks[0].Outputs[?OutputKey==`HumanResourcesKnowledgeBaseId`].OutputValue' \
-    --output text)
-
-KB_MEETINGS=$(aws cloudformation describe-stacks \
-    --stack-name $STACK_NAME \
-    --region $REGION \
-    --query 'Stacks[0].Outputs[?OutputKey==`MeetingNotesKnowledgeBaseId`].OutputValue' \
+    --query 'Stacks[0].Outputs[?OutputKey==`ModelId`].OutputValue' \
     --output text)
 
 # Get CloudFront and API Gateway URLs
@@ -359,7 +338,6 @@ API_ENDPOINT=$(aws cloudformation describe-stacks \
     --output text)
 
 # Mask sensitive IDs for display
-MASKED_AGENT_ID="***${AGENT_ID:7}"  # Show last 3 chars
 MASKED_BUCKET_NAME=$(echo "$BUCKET_NAME" | sed -E "s/${ACCOUNT_ID}/***${ACCOUNT_ID:9}/g")
 
 echo ""
@@ -367,10 +345,8 @@ print_status "Infrastructure deployment complete!"
 echo ""
 print_info "Key Resources:"
 echo "  S3 Bucket:          $MASKED_BUCKET_NAME"
-echo "  Agent ID:           $MASKED_AGENT_ID"
-echo "  Financial KB:       $KB_FINANCIAL"
-echo "  HR KB:              $KB_HR"
-echo "  Meeting Notes KB:   $KB_MEETINGS"
+echo "  Knowledge Base:     $KB_ID"
+echo "  Model:              $MODEL_ID"
 sleep 3
 
 # ============================================================================
@@ -415,7 +391,7 @@ echo -e "  ${CYAN}●${NC} Chunking documents into smaller pieces"
 echo -e "  ${CYAN}●${NC} Generating embeddings using Titan Embed Text v2"
 echo -e "  ${CYAN}●${NC} Storing vectors in S3 Vector bucket"
 echo ""
-print_warning "This typically takes 5-8 minutes for 11 documents"
+print_warning "This typically takes 5-8 minutes for 17 documents"
 echo ""
 
 # Get Knowledge Base and Data Source IDs from stack outputs
@@ -593,42 +569,6 @@ fi
 sleep 2
 
 # ============================================================================
-# PHASE 5.5: Prepare Bedrock Agent
-# ============================================================================
-
-print_header "Preparing Bedrock Agent"
-
-# Get Agent ID from stack outputs
-AGENT_ID=$(aws cloudformation describe-stacks \
-    --stack-name $STACK_NAME \
-    --region $REGION \
-    --query 'Stacks[0].Outputs[?contains(OutputKey, `AgentIdOutput`)].OutputValue' \
-    --output text 2>/dev/null)
-
-if [ -n "$AGENT_ID" ] && [ "$AGENT_ID" != "None" ]; then
-    MASKED_AGENT_ID2="***${AGENT_ID:7}"  # Show last 3 chars
-    print_info "Agent ID: $MASKED_AGENT_ID2"
-    echo -e "  ${CYAN}●${NC} Preparing agent to make it ready for invocation..."
-    echo ""
-
-    if aws bedrock-agent prepare-agent \
-        --agent-id "$AGENT_ID" \
-        --region $REGION > /dev/null 2>&1; then
-        print_status "Agent prepared successfully"
-        echo -e "  ${CYAN}●${NC} Agent is now ready to answer questions"
-    else
-        print_warning "Could not prepare agent automatically"
-        print_info "You can prepare it manually later (check deployment-outputs.json)"
-    fi
-else
-    print_warning "Agent ID not found in stack outputs"
-    print_info "Agent may need to be prepared manually"
-fi
-
-echo ""
-sleep 2
-
-# ============================================================================
 # PHASE 6: Setup Complete & Next Steps
 # ============================================================================
 
@@ -641,8 +581,8 @@ cat << "EOF"
     ║   ✓ Infrastructure Deployed                                  ║
     ║   ✓ Web UI Deployed                                          ║
     ║   ✓ Documents Uploaded                                       ║
-    ║   ✓ Knowledge Bases Ingested                                 ║
-    ║   ✓ Agent Ready to Use                                       ║
+    ║   ✓ Knowledge Base Ingested                                  ║
+    ║   ✓ Ready to Query                                           ║
     ║                                                               ║
     ║          Your RAG System is Fully Operational! 🎉            ║
     ║                                                               ║
@@ -659,25 +599,24 @@ echo -e "${CYAN}Web UI:${NC}"
 echo "  ✓ CloudFront Distribution (global CDN with HTTPS)"
 echo "  ✓ S3 Static Website Hosting"
 echo "  ✓ API Gateway REST API"
-echo "  ✓ Lambda Function for Bedrock Integration"
+echo "  ✓ Lambda Function calling RetrieveAndGenerate"
 echo ""
 echo -e "${CYAN}Infrastructure:${NC}"
 echo "  ✓ 1 S3 Bucket with 3 organized folders (Nobler Works data)"
 echo "  ✓ 1 S3 Vector Bucket + Index (serverless vector DB - 70% cheaper!)"
-echo "  ✓ 1 Knowledge Base (indexes all 11 documents)"
-echo "  ✓ 1 Bedrock Agent with knowledge base integration"
+echo "  ✓ 1 Knowledge Base (indexes all 17 documents)"
 echo ""
 echo -e "${CYAN}Sample Data (Nobler Works):${NC}"
-echo "  ✓ 11 realistic company documents ingested"
+echo "  ✓ 17 realistic company documents ingested"
 echo "  ✓ Financial reports, budgets, policies"
 echo "  ✓ Employee handbook, benefits, HR policies"
 echo "  ✓ Executive meetings, product plans, retros"
 echo ""
 echo -e "${CYAN}AI Capabilities:${NC}"
-echo "  ✓ Claude 3 Sonnet (foundation model)"
+echo "  ✓ $MODEL_ID (generation model)"
 echo "  ✓ Titan Embeddings v2 (1024-dim vectors)"
 echo "  ✓ Semantic search across all documents"
-echo "  ✓ Agent responses with citations"
+echo "  ✓ Grounded answers with citations"
 echo ""
 
 echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
@@ -693,7 +632,7 @@ else
 fi
 echo ""
 echo -e "${YELLOW}Option 2: Command Line Interface${NC}"
-echo -e "  ${GREEN}npm run test-agent${NC}"
+echo -e "  ${GREEN}npm run test-rag${NC}"
 echo ""
 
 echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
@@ -741,8 +680,8 @@ fi
 echo ""
 echo -e "${CYAN}Backend Resources:${NC}"
 echo "  S3 Bucket:          $MASKED_BUCKET_NAME"
-echo "  Agent ID:           $MASKED_AGENT_ID"
-echo "  Agent Alias:        ***${AGENT_ALIAS:7}"
+echo "  Knowledge Base:     $KB_ID"
+echo "  Model:              $MODEL_ID"
 echo ""
 echo -e "${YELLOW}ℹ Note:${NC} Full resource IDs saved to deployment-outputs.json"
 echo ""
@@ -759,14 +698,14 @@ else
 fi
 echo ""
 echo -e "${YELLOW}2. Test with command line:${NC}"
-echo -e "   ${GREEN}npm run test-agent${NC}"
+echo -e "   ${GREEN}npm run test-rag${NC}"
 echo ""
 echo -e "${YELLOW}3. Add your own documents:${NC}"
 echo -e "   ${GREEN}aws s3 cp my-doc.pdf s3://$BUCKET_NAME/Financial-Data/${NC}"
 echo -e "   ${GREEN}npm run upload-docs${NC}  ${CYAN}# Re-ingests all KBs${NC}"
 echo ""
-echo -e "${YELLOW}4. Customize the agent:${NC}"
-echo -e "   ${CYAN}• Edit ${GREEN}lib/s3-rag-stack.ts${CYAN} to modify instructions${NC}"
+echo -e "${YELLOW}4. Customize the assistant:${NC}"
+echo -e "   ${CYAN}• Edit ${GREEN}lib/s3-rag-stack.ts${CYAN} for the prompt template and model${NC}"
 echo -e "   ${CYAN}• Edit ${GREEN}lib/knowledge-base-construct.ts${CYAN} for KB settings${NC}"
 echo -e "   ${CYAN}• Run ${GREEN}cdk deploy${CYAN} to apply changes${NC}"
 echo ""
@@ -776,8 +715,7 @@ echo -e "   ${CYAN}• Follow the full tutorial in ${GREEN}docs/${CYAN} folder${
 echo ""
 echo -e "${YELLOW}6. When finished testing - DELETE RESOURCES IMMEDIATELY:${NC}"
 echo -e "   ${RED}${BOLD}⚠️  These resources cost ~\$1-5/month if left running!${NC}"
-echo -e "   ${CYAN}Follow manual cleanup steps in README.md${NC}"
-echo -e "   ${CYAN}Manual cleanup works 100% reliably (takes 3-5 minutes)${NC}"
+echo -e "   ${GREEN}npm run destroy${NC}  ${CYAN}# or: cdk destroy${NC}"
 echo ""
 
 echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
@@ -788,9 +726,8 @@ print_warning "💰 Cost: ~\$5/month (S3 Vectors, Bedrock, CloudFront)"
 print_warning "🗑️  Delete resources IMMEDIATELY after testing to avoid charges"
 echo ""
 echo -e "${RED}${BOLD}CLEANUP INSTRUCTIONS:${NC}"
-echo -e "  ${CYAN}1. See README.md \"Cleanup\" section for manual deletion steps${NC}"
-echo -e "  ${CYAN}2. Manual cleanup is REQUIRED (automated tools may fail)${NC}"
-echo -e "  ${CYAN}3. Delete in order: Agent → KB → S3 Vectors → S3 Data → CloudFormation${NC}"
+echo -e "  ${CYAN}Run ${GREEN}npm run destroy${CYAN} - the stack is all native CloudFormation,${NC}"
+echo -e "  ${CYAN}so it tears down cleanly in one command.${NC}"
 echo ""
 print_info "All outputs saved to: deployment-outputs.json"
 echo ""

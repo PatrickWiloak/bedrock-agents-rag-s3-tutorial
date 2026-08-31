@@ -1,674 +1,262 @@
-# Step 5: Testing & Deployment
+# Step 5: Testing & Production
 
-Learn comprehensive testing strategies and best practices for deploying your RAG agent to production.
+How to tell whether the system actually works, and what to change before anyone depends on it.
 
-## Testing Strategy
+## The diagnostic script
 
-### 1. Unit Testing Documents
-
-Test individual document ingestion:
+Start here whenever something is wrong:
 
 ```bash
-# Upload single document
-aws s3 cp test-doc.md s3://$BUCKET/test-doc.md
-
-# Start ingestion
-aws bedrock-agent start-ingestion-job \
-  --knowledge-base-id $KB_ID \
-  --data-source-id $DS_ID
-
-# Verify ingestion
-aws bedrock-agent list-ingestion-jobs \
-  --knowledge-base-id $KB_ID \
-  --data-source-id $DS_ID
+./test-bedrock.sh
 ```
 
-### 2. Query Testing
+It walks the stack bottom-up and stops at the first genuinely broken layer:
 
-Create a test suite for your agent:
+1. **Credentials** - can we call STS at all?
+2. **Stack outputs** - is the stack deployed, and does it expose what we expect?
+3. **Model access** - is the configured inference profile reachable?
+4. **Knowledge base** - is it `ACTIVE`, and is its storage type `S3_VECTORS`?
+5. **Ingestion** - has a job run, and did it complete without failures?
+6. **End-to-end query** - a real `RetrieveAndGenerate` call with citations
 
-```typescript
-// tests/agent-qa.ts
-import { BedrockAgentRuntimeClient, InvokeAgentCommand } from '@aws-sdk/client-bedrock-agent-runtime';
+This ordering matters. A failure at the web UI could be caused by any layer beneath it, and guessing wastes time.
 
-interface TestCase {
-  query: string;
-  expectedKeywords: string[];
-  expectCitations: boolean;
-}
+> Step 6 invokes the model, so it costs a few cents per run.
 
-const testCases: TestCase[] = [
-  {
-    query: 'What is RAG?',
-    expectedKeywords: ['retrieval', 'augmented', 'generation'],
-    expectCitations: true
-  },
-  {
-    query: 'How do I deploy?',
-    expectedKeywords: ['cdk', 'deploy', 'npm'],
-    expectCitations: true
-  },
-  {
-    query: 'What is the weather today?',
-    expectedKeywords: ['knowledge base', 'cannot', 'don\'t have'],
-    expectCitations: false
-  }
-];
+## Testing strategy
 
-async function runTests(agentId: string, aliasId: string) {
-  const client = new BedrockAgentRuntimeClient({ region: 'us-east-1' });
+### 1. Ingestion testing
 
-  let passed = 0;
-  let failed = 0;
-
-  for (const test of testCases) {
-    const sessionId = `test-${Date.now()}`;
-
-    try {
-      const response = await client.send(new InvokeAgentCommand({
-        agentId,
-        agentAliasId: aliasId,
-        sessionId,
-        inputText: test.query
-      }));
-
-      let fullResponse = '';
-      let citations: any[] = [];
-
-      for await (const event of response.completion) {
-        if (event.chunk?.bytes) {
-          fullResponse += new TextDecoder().decode(event.chunk.bytes);
-        }
-        if (event.chunk?.attribution?.citations) {
-          citations.push(...event.chunk.attribution.citations);
-        }
-      }
-
-      // Check keywords
-      const hasKeywords = test.expectedKeywords.some(keyword =>
-        fullResponse.toLowerCase().includes(keyword.toLowerCase())
-      );
-
-      // Check citations
-      const hasCitations = citations.length > 0;
-
-      if (hasKeywords && hasCitations === test.expectCitations) {
-        console.log(`✓ PASS: ${test.query}`);
-        passed++;
-      } else {
-        console.log(`✗ FAIL: ${test.query}`);
-        console.log(`  Expected keywords: ${test.expectedKeywords}`);
-        console.log(`  Response: ${fullResponse.substring(0, 100)}...`);
-        failed++;
-      }
-    } catch (error) {
-      console.log(`✗ ERROR: ${test.query}`);
-      console.error(error);
-      failed++;
-    }
-  }
-
-  console.log(`\nResults: ${passed} passed, ${failed} failed`);
-  return failed === 0;
-}
-
-// Run tests
-runTests(process.env.AGENT_ID!, process.env.ALIAS_ID!);
-```
-
-### 3. Performance Testing
-
-Measure latency and throughput:
-
-```typescript
-// tests/performance.ts
-async function performanceTest(agentId: string, aliasId: string) {
-  const queries = [
-    'What is RAG?',
-    'How do I deploy?',
-    'What models are available?'
-  ];
-
-  const results = [];
-
-  for (const query of queries) {
-    const start = Date.now();
-
-    await invokeAgent(agentId, aliasId, `perf-${Date.now()}`, query);
-
-    const latency = Date.now() - start;
-    results.push({ query, latency });
-  }
-
-  // Calculate statistics
-  const latencies = results.map(r => r.latency);
-  const avg = latencies.reduce((a, b) => a + b) / latencies.length;
-  const max = Math.max(...latencies);
-  const min = Math.min(...latencies);
-
-  console.log('Performance Results:');
-  console.log(`  Average: ${avg}ms`);
-  console.log(`  Min: ${min}ms`);
-  console.log(`  Max: ${max}ms`);
-
-  results.forEach(r => {
-    console.log(`  ${r.query}: ${r.latency}ms`);
-  });
-}
-```
-
-### 4. Load Testing
-
-Test concurrent requests:
-
-```typescript
-// tests/load-test.ts
-async function loadTest(agentId: string, aliasId: string, concurrency: number) {
-  const queries = Array(concurrency).fill('What is RAG?');
-
-  const start = Date.now();
-
-  await Promise.all(
-    queries.map((query, i) =>
-      invokeAgent(agentId, aliasId, `load-${i}`, query)
-    )
-  );
-
-  const duration = Date.now() - start;
-  const throughput = concurrency / (duration / 1000);
-
-  console.log(`Load Test (${concurrency} concurrent requests):`);
-  console.log(`  Duration: ${duration}ms`);
-  console.log(`  Throughput: ${throughput.toFixed(2)} req/s`);
-}
-```
-
-## Validation Checklist
-
-### Pre-Deployment Checks
-
-- [ ] All ingestion jobs completed successfully
-- [ ] Test queries return relevant answers
-- [ ] Citations are present and accurate
-- [ ] Out-of-scope queries handled gracefully
-- [ ] Multi-turn conversations maintain context
-- [ ] Response latency is acceptable
-- [ ] Cost estimates reviewed
-
-### Knowledge Base Quality
+Before trusting answers, confirm the documents made it in.
 
 ```bash
-# 1. Check document count
-aws s3 ls s3://$BUCKET/ --recursive | wc -l
+KB_ID=$(aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`KnowledgeBaseIdOutput`].OutputValue' --output text)
+DS_ID=$(aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`DataSourceIdOutput`].OutputValue' --output text)
 
-# 2. Verify ingestion status
 aws bedrock-agent list-ingestion-jobs \
-  --knowledge-base-id $KB_ID \
-  --data-source-id $DS_ID \
-  --max-results 1
+  --knowledge-base-id "$KB_ID" --data-source-id "$DS_ID" \
+  --query 'ingestionJobSummaries[0].statistics'
+```
 
-# 3. Test direct retrieval
+`numberOfDocumentsFailed` must be `0`. If not:
+
+```bash
+aws bedrock-agent get-ingestion-job \
+  --knowledge-base-id "$KB_ID" --data-source-id "$DS_ID" \
+  --ingestion-job-id <JOB_ID> --query 'ingestionJob.failureReasons'
+```
+
+### 2. Retrieval testing (without generation)
+
+Test retrieval in isolation. If the right chunks aren't coming back, no prompt template will save the answer.
+
+```bash
 aws bedrock-agent-runtime retrieve \
-  --knowledge-base-id $KB_ID \
-  --retrieval-query text="test query"
+  --knowledge-base-id "$KB_ID" \
+  --retrieval-query '{"text":"remote work policy"}' \
+  --retrieval-configuration '{"vectorSearchConfiguration":{"numberOfResults":5}}' \
+  --query 'retrievalResults[].[score,location.s3Location.uri]' --output table
 ```
 
-### Agent Quality
+This separates two very different failures:
+
+- **Wrong documents returned** → a retrieval problem: chunking, embeddings, or `numberOfResults`
+- **Right documents, bad answer** → a generation problem: prompt template or model
+
+### 3. Query testing
 
 ```bash
-# 1. Check agent status
-aws bedrock-agent get-agent --agent-id $AGENT_ID
-
-# 2. Verify KB association
-aws bedrock-agent list-agent-knowledge-bases \
-  --agent-id $AGENT_ID \
-  --agent-version DRAFT
-
-# 3. Test invocation
-npm run test-agent demo
+npm run test-rag
 ```
 
-## Monitoring & Observability
+The scripted questions cover all three document categories. Keep them fixed so runs stay comparable, and add your own with known-correct answers.
 
-### CloudWatch Metrics
+Score each answer on four axes:
 
-Key metrics to monitor:
+| Axis | Question |
+|---|---|
+| **Grounded** | Is every claim actually in a cited document? |
+| **Complete** | Did it miss something the documents do contain? |
+| **Honest** | Does it admit gaps instead of inventing? |
+| **Cited** | Are the sources the ones a human would have used? |
 
-1. **Invocation Count**
-   - Metric: `InvocationCount`
-   - Dimension: AgentId
+Deliberately include questions the corpus **cannot** answer. A system that confidently answers those is worse than one that returns nothing.
 
-2. **Invocation Latency**
-   - Metric: `InvocationLatency`
-   - Dimension: AgentId
-
-3. **Errors**
-   - Metric: `Errors`
-   - Dimension: AgentId
-
-### Setting Up Alarms
-
-```typescript
-import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
-import * as sns from 'aws-cdk-lib/aws-sns';
-
-// Create SNS topic for alerts
-const alertTopic = new sns.Topic(this, 'AgentAlerts', {
-  displayName: 'RAG Agent Alerts'
-});
-
-// Alarm for high latency
-new cloudwatch.Alarm(this, 'HighLatencyAlarm', {
-  metric: new cloudwatch.Metric({
-    namespace: 'AWS/Bedrock',
-    metricName: 'InvocationLatency',
-    dimensionsMap: {
-      AgentId: agent.agentId
-    },
-    statistic: 'Average',
-    period: cdk.Duration.minutes(5)
-  }),
-  threshold: 5000,  // 5 seconds
-  evaluationPeriods: 2,
-  alarmDescription: 'Agent response time is high',
-  actionsEnabled: true
-});
-
-// Alarm for errors
-new cloudwatch.Alarm(this, 'ErrorRateAlarm', {
-  metric: new cloudwatch.Metric({
-    namespace: 'AWS/Bedrock',
-    metricName: 'Errors',
-    dimensionsMap: {
-      AgentId: agent.agentId
-    },
-    statistic: 'Sum',
-    period: cdk.Duration.minutes(5)
-  }),
-  threshold: 5,
-  evaluationPeriods: 1,
-  alarmDescription: 'Agent error rate is high'
-});
+```
+❓ What is our policy on submarine maintenance?
+✅ Good: "That isn't covered in the documents I have access to."
+❌ Bad:  A plausible, entirely invented policy.
 ```
 
-### Custom Logging
-
-Add structured logging:
-
-```typescript
-import * as winston from 'winston';
-
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.json(),
-  transports: [
-    new winston.transports.File({ filename: 'agent.log' })
-  ]
-});
-
-async function invokeAgentWithLogging(agentId, aliasId, sessionId, query) {
-  const start = Date.now();
-
-  try {
-    logger.info('Agent invocation started', {
-      agentId,
-      sessionId,
-      query: query.substring(0, 100)
-    });
-
-    const response = await invokeAgent(agentId, aliasId, sessionId, query);
-
-    logger.info('Agent invocation completed', {
-      agentId,
-      sessionId,
-      latency: Date.now() - start,
-      citationCount: response.citations.length
-    });
-
-    return response;
-  } catch (error) {
-    logger.error('Agent invocation failed', {
-      agentId,
-      sessionId,
-      error: error.message
-    });
-    throw error;
-  }
-}
-```
-
-## Production Deployment
-
-### Environment Strategy
-
-Use separate stacks for dev/prod:
-
-```typescript
-// bin/s3-rag-app.ts
-const app = new cdk.App();
-
-const env = app.node.tryGetContext('env') || 'dev';
-
-new S3VectorRAGStack(app, `S3VectorRAGStack-${env}`, {
-  env: {
-    account: process.env.CDK_DEFAULT_ACCOUNT,
-    region: process.env.CDK_DEFAULT_REGION,
-  },
-  stackName: `S3VectorRAGStack-${env}`,
-  tags: {
-    Environment: env,
-    Project: 'RAG-Tutorial'
-  }
-});
-```
-
-Deploy to different environments:
+### 4. Performance testing
 
 ```bash
-# Development
-cdk deploy -c env=dev
-
-# Production
-cdk deploy -c env=prod
+time npm run test-rag
 ```
 
-### Production Configuration
+Latency is dominated by generation. Expect a few seconds per question with Haiku, longer with Opus. If it's much worse, check `numberOfResults` and chunk size - both drive prompt length.
 
-```typescript
-// lib/config.ts
-export const config = {
-  dev: {
-    foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0',
-    chunkSize: 300,
-    removalPolicy: cdk.RemovalPolicy.DESTROY
-  },
-  prod: {
-    foundationModel: 'anthropic.claude-3-sonnet-20240229-v1:0',
-    chunkSize: 500,
-    removalPolicy: cdk.RemovalPolicy.RETAIN
-  }
-};
+### 5. Load testing
 
-// In stack:
-const env = this.node.tryGetContext('env') || 'dev';
-const envConfig = config[env];
+API Gateway is configured with `throttlingRateLimit: 100` and `throttlingBurstLimit: 200` in [lib/web-hosting-construct.ts](../lib/web-hosting-construct.ts). Bedrock has its own account-level quotas, which are usually the real ceiling. Raise them via Service Quotas before any load test that matters.
 
-const agent = new BedrockAgentConstruct(this, 'BedrockAgent', {
-  foundationModel: envConfig.foundationModel,
-  // ...
-});
-```
+## Validation checklist
 
-### Blue/Green Deployment
+Before calling a deployment good:
 
-Create multiple agent aliases:
+- [ ] `./test-bedrock.sh` passes end to end
+- [ ] Ingestion shows 0 failed documents
+- [ ] `Retrieve` returns sensible documents for 5+ representative queries
+- [ ] Answers cite the correct sources
+- [ ] Out-of-scope questions are refused, not invented
+- [ ] Multi-turn follow-ups resolve correctly (session handling works)
+- [ ] The CloudFront URL loads and can hold a conversation
+- [ ] `cdk destroy` on a scratch deployment leaves nothing behind
 
-```typescript
-// Create new version
-const createVersion = new cr.AwsCustomResource(this, 'CreateAgentVersion', {
-  onCreate: {
-    service: 'BedrockAgent',
-    action: 'createAgentVersion',
-    parameters: {
-      agentId: this.agentId,
-      description: 'Version 2.0'
-    }
-  }
-});
+## Monitoring & observability
 
-// Create new alias pointing to new version
-const blueAlias = new cr.AwsCustomResource(this, 'BlueAlias', {
-  onCreate: {
-    service: 'BedrockAgent',
-    action: 'createAgentAlias',
-    parameters: {
-      agentId: this.agentId,
-      agentAliasName: 'blue',
-      agentVersion: '1'
-    }
-  }
-});
+### CloudWatch metrics
 
-const greenAlias = new cr.AwsCustomResource(this, 'GreenAlias', {
-  onCreate: {
-    service: 'BedrockAgent',
-    action: 'createAgentAlias',
-    parameters: {
-      agentId: this.agentId,
-      agentAliasName: 'green',
-      agentVersion: '2'
-    }
-  }
-});
-```
+Bedrock publishes under `AWS/Bedrock`:
 
-### Gradual Rollout
+| Metric | Watch for |
+|---|---|
+| `InvocationLatency` | Rising p99 - usually prompt growth |
+| `InvocationClientErrors` | 4xx - throttling, validation, access denied |
+| `InvocationServerErrors` | 5xx - retry with backoff |
+| `InputTokenCount` | Drives cost; grows with `numberOfResults` |
+| `OutputTokenCount` | Drives cost |
 
-Route traffic between aliases:
+### Lambda logs
 
-```typescript
-// In your application
-const aliases = ['blue', 'green'];
-const bluePercentage = 90;  // 90% to blue, 10% to green
-
-const selectedAlias = Math.random() * 100 < bluePercentage ? 'blue' : 'green';
-
-const response = await invokeAgent(agentId, selectedAlias, sessionId, query);
-```
-
-## CI/CD Integration
-
-### GitHub Actions Example
-
-```yaml
-# .github/workflows/deploy.yml
-name: Deploy RAG Agent
-
-on:
-  push:
-    branches: [main]
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-
-      - name: Deploy to Dev
-        run: cdk deploy -c env=dev --require-approval never
-
-      - name: Run Tests
-        run: npm test
-
-      - name: Deploy to Prod
-        if: success()
-        run: cdk deploy -c env=prod --require-approval never
-```
-
-## Rollback Procedures
-
-### Quick Rollback
-
-If issues occur in production:
+Every request logs with a `[RAG]` prefix - configuration, response length, citation count, and full error detail including `requestId`.
 
 ```bash
-# 1. Switch to previous agent version
-aws bedrock-agent update-agent-alias \
-  --agent-id $AGENT_ID \
-  --agent-alias-id $ALIAS_ID \
-  --routing-configuration agentVersion=1
-
-# 2. Or redeploy previous CDK version
-git checkout <previous-commit>
-cdk deploy -c env=prod
+FN=$(aws cloudformation describe-stack-resources --stack-name S3VectorRAGStack \
+  --query "StackResources[?ResourceType=='AWS::Lambda::Function' && contains(LogicalResourceId,'BedrockApi')].PhysicalResourceId" \
+  --output text)
+aws logs tail "/aws/lambda/$FN" --follow
 ```
 
-### Rollback Checklist
-
-- [ ] Verify issue (check CloudWatch logs)
-- [ ] Notify stakeholders
-- [ ] Switch to previous version
-- [ ] Verify rollback successful
-- [ ] Investigate root cause
-- [ ] Document incident
-
-## Cost Optimization
-
-### Cost Monitoring
-
-```typescript
-// Add cost allocation tags
-const agent = new BedrockAgentConstruct(this, 'BedrockAgent', {
-  // ...
-});
-
-cdk.Tags.of(agent).add('CostCenter', 'AI-Platform');
-cdk.Tags.of(agent).add('Environment', 'Production');
-```
-
-### Cost Reduction Strategies
-
-1. **Use cheaper models for simple queries**
-   ```typescript
-   // Route based on complexity
-   const model = isComplexQuery(query)
-     ? 'claude-3-sonnet'
-     : 'claude-3-haiku';
-   ```
-
-2. **Implement caching**
-   ```typescript
-   const cache = new Map();
-
-   async function cachedInvoke(query) {
-     if (cache.has(query)) {
-       return cache.get(query);
-     }
-     const response = await invokeAgent(query);
-     cache.set(query, response);
-     return response;
-   }
-   ```
-
-3. **Reduce OpenSearch OCUs**
-   - Delete unused collections
-   - Use scheduled scaling
-   - Consider Aurora Serverless for vectors (alternative)
-
-## Security Hardening
-
-### IAM Best Practices
-
-```typescript
-// Principle of least privilege
-knowledgeBaseRole.addToPolicy(new iam.PolicyStatement({
-  effect: iam.Effect.ALLOW,
-  actions: [
-    's3:GetObject'  // Only what's needed
-  ],
-  resources: [
-    `${dataBucket.bucketArn}/*`  // Specific bucket only
-  ]
-}));
-```
-
-### Enable Encryption
-
-```typescript
-const dataBucket = new s3.Bucket(this, 'DataBucket', {
-  encryption: s3.BucketEncryption.KMS,  // Use KMS
-  encryptionKey: new kms.Key(this, 'BucketKey', {
-    enableKeyRotation: true
-  })
-});
-```
-
-### VPC Endpoints (Optional)
-
-```typescript
-// For added security, use VPC endpoints
-const vpc = new ec2.Vpc(this, 'Vpc');
-
-// Bedrock VPC endpoint
-new ec2.InterfaceVpcEndpoint(this, 'BedrockEndpoint', {
-  vpc,
-  service: new ec2.InterfaceVpcEndpointService(
-    `com.amazonaws.${this.region}.bedrock-runtime`
-  )
-});
-```
-
-## Disaster Recovery
-
-### Backup Strategy
+### An alarm worth having
 
 ```bash
-# Export agent configuration
-aws bedrock-agent get-agent --agent-id $AGENT_ID > agent-backup.json
-
-# Export KB configuration
-aws bedrock-agent get-knowledge-base --knowledge-base-id $KB_ID > kb-backup.json
-
-# Backup S3 documents
-aws s3 sync s3://$BUCKET/ ./backup/
+aws cloudwatch put-metric-alarm \
+  --alarm-name bedrock-rag-client-errors \
+  --namespace AWS/Bedrock --metric-name InvocationClientErrors \
+  --statistic Sum --period 300 --evaluation-periods 1 --threshold 10 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions <YOUR_SNS_TOPIC_ARN>
 ```
 
-### Recovery Procedures
+Point it at a topic a human actually reads. An alarm with no recipient is decoration.
+
+## Taking this to production
+
+This stack is a tutorial. Several deliberate choices are wrong for production.
+
+### 1. Data would be deleted with the stack
+
+```typescript
+removalPolicy: cdk.RemovalPolicy.DESTROY,
+autoDeleteObjects: true,
+```
+
+Both buckets use these so `cdk destroy` is clean. In production, use `RETAIN`, enable versioning, and turn on deletion protection. A `cdk destroy` against the wrong account should not be able to delete your corpus.
+
+### 2. The API is unauthenticated
+
+`POST /chat` is open to the internet, with `Access-Control-Allow-Origin: '*'`. Anyone who finds the URL can spend your Bedrock budget.
+
+At minimum, add:
+
+- An authorizer - Cognito, Lambda, or IAM
+- A CORS origin restricted to your CloudFront domain
+- A usage plan and API key, or WAF rate limiting per IP
+
+### 3. No budget guardrail
+
+Generation cost scales with traffic and nothing here caps it. Add an AWS Budget with an alert, and consider a per-session query limit in the Lambda.
+
+### 4. Environments aren't separated
+
+One stack name, one account. For production, parameterise the stack name and deploy dev and prod to separate accounts:
 
 ```bash
-# 1. Redeploy infrastructure
+cdk deploy --context stackName=RagStack-dev
+cdk deploy --context stackName=RagStack-prod
+```
+
+### 5. Ingestion is manual
+
+`npm run upload-docs` is a human action. In production, trigger `StartIngestionJob` from an S3 event notification or a schedule, and alarm on ingestion failure.
+
+### 6. No guardrails
+
+Bedrock Guardrails add content filtering, denied topics, and PII redaction. See [chapter 06](06-advanced.md).
+
+## Security hardening
+
+**IAM.** The knowledge base and Lambda roles are already scoped to specific resources and actions. [iam-policy.json](../iam-policy.json) is deliberately broad (`Resource: "*"`) because the resources don't exist until the stack creates them - scope it down for anything beyond a tutorial.
+
+**Encryption.** Both S3 buckets use `S3_MANAGED` encryption and `enforceSSL`. For production, use a customer-managed KMS key; both `AWS::S3Vectors::VectorBucket` and `AWS::S3Vectors::Index` accept an `EncryptionConfiguration`.
+
+**Network.** Everything here traverses public AWS endpoints. For a VPC-bound deployment, add interface endpoints for Bedrock and gateway endpoints for S3.
+
+**Logging.** Enable CloudTrail data events for the document bucket if you need to know who read what.
+
+## Cost management
+
+```bash
+aws ce get-cost-and-usage \
+  --time-period Start=$(date -u -d '30 days ago' +%Y-%m-%d),End=$(date -u +%Y-%m-%d) \
+  --granularity MONTHLY --metrics UnblendedCost \
+  --filter '{"Dimensions":{"Key":"SERVICE","Values":["Amazon Bedrock"]}}'
+```
+
+Reduction levers, in order of impact:
+
+1. **Cheaper model** - Haiku 4.5 instead of Opus 5 is the single biggest lever
+2. **Lower `numberOfResults`** - fewer chunks means fewer input tokens per query
+3. **Smaller chunks** - same effect
+4. **Cache repeated questions** - identical questions shouldn't hit Bedrock twice
+5. **Delete idle stacks** - `npm run destroy`
+
+S3 Vectors bills per request and per GB rather than for provisioned capacity, so an idle stack costs almost nothing. Generation is essentially the whole bill.
+
+## Disaster recovery
+
+The documents in S3 are the source of truth. Everything else - vectors, index, knowledge base - is derived and can be rebuilt.
+
+```bash
+# Back up what actually matters
+aws s3 sync "s3://$BUCKET/" ./backup/
+
+# Rebuild from scratch
 cdk deploy
-
-# 2. Restore documents
-aws s3 sync ./backup/ s3://$NEW_BUCKET/
-
-# 3. Trigger ingestion
-aws bedrock-agent start-ingestion-job \
-  --knowledge-base-id $NEW_KB_ID \
-  --data-source-id $NEW_DS_ID
+aws s3 sync ./backup/ "s3://$NEW_BUCKET/"
+npm run upload-docs
 ```
 
-## Production Checklist
+That property is worth keeping: **never let the vector store become the only copy of anything.**
 
-Before going live:
+## Production checklist
 
-- [ ] All tests passing
-- [ ] CloudWatch alarms configured
-- [ ] Logging implemented
-- [ ] Cost budget set
-- [ ] Backup procedures documented
-- [ ] Rollback plan tested
-- [ ] Security review completed
-- [ ] Load testing performed
-- [ ] Documentation updated
-- [ ] Stakeholders notified
+- [ ] Removal policies set to `RETAIN` for anything holding data
+- [ ] S3 versioning enabled on the document bucket
+- [ ] API authentication in place
+- [ ] CORS restricted to known origins
+- [ ] Rate limiting or WAF configured
+- [ ] AWS Budget with a real alert recipient
+- [ ] CloudWatch alarms on client and server errors
+- [ ] Ingestion automated and alarmed
+- [ ] Guardrails configured
+- [ ] Separate dev and prod accounts
+- [ ] Document backups outside the stack
+- [ ] IAM scoped to specific resource ARNs
 
-## Next Steps
+## Next steps
 
-Learn advanced features and integrations!
-
-→ Continue to [Step 6: Advanced Customization](06-advanced.md)
-
-## Resources
-
-- [AWS Well-Architected Framework](https://aws.amazon.com/architecture/well-architected/)
-- [Bedrock Best Practices](https://docs.aws.amazon.com/bedrock/latest/userguide/best-practices.html)
-- [CDK Testing](https://docs.aws.amazon.com/cdk/v2/guide/testing.html)
+→ **[Step 6: Advanced Topics](06-advanced.md)** - guardrails, multiple knowledge bases, reranking, and where agents fit now.

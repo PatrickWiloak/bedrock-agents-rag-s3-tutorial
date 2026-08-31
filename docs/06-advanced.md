@@ -1,819 +1,217 @@
-# Step 6: Advanced Customization
+# Step 6: Advanced Topics
 
-Explore advanced features including custom tools, API Gateway integration, Lambda functions, and production-ready patterns.
+Patterns that go beyond a single knowledge base answering a single question.
 
-## Custom Action Groups
-
-Action Groups let your agent execute custom code via Lambda functions.
-
-### Use Cases
-
-- **Database queries**: Fetch real-time data
-- **API calls**: Integrate external services
-- **Calculations**: Perform complex computations
-- **Workflows**: Trigger business processes
-
-### Architecture
-
-```
-User Query → Agent → Action Decision → Lambda → Response
-                ↓                        ↓
-         Knowledge Base              Database/API
-```
-
-### Creating a Custom Tool
-
-#### 1. Define the Lambda Function
-
-```typescript
-// lambda/custom-tool/index.ts
-export const handler = async (event: any) => {
-  const { actionGroup, function: functionName, parameters } = event;
-
-  console.log('Action invoked:', functionName);
-  console.log('Parameters:', parameters);
-
-  // Example: Get current pricing
-  if (functionName === 'get_pricing') {
-    const tier = parameters.find(p => p.name === 'tier')?.value || 'basic';
-
-    const pricing = {
-      basic: 10,
-      pro: 50,
-      enterprise: 200
-    };
-
-    return {
-      response: {
-        actionGroup,
-        function: functionName,
-        functionResponse: {
-          responseBody: {
-            TEXT: {
-              body: JSON.stringify({
-                tier,
-                price: pricing[tier],
-                currency: 'USD'
-              })
-            }
-          }
-        }
-      }
-    };
-  }
-
-  // Example: Check service status
-  if (functionName === 'check_status') {
-    const service = parameters.find(p => p.name === 'service')?.value;
-
-    return {
-      response: {
-        actionGroup,
-        function: functionName,
-        functionResponse: {
-          responseBody: {
-            TEXT: {
-              body: JSON.stringify({
-                service,
-                status: 'operational',
-                uptime: '99.9%'
-              })
-            }
-          }
-        }
-      }
-    };
-  }
-
-  throw new Error(`Unknown function: ${functionName}`);
-};
-```
-
-#### 2. Add Lambda to CDK Stack
-
-```typescript
-// lib/s3-rag-stack.ts
-import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as nodejs from 'aws-cdk-lib/aws-lambda-nodejs';
-
-// Create Lambda function
-const actionLambda = new nodejs.NodejsFunction(this, 'ActionLambda', {
-  entry: path.join(__dirname, '../lambda/custom-tool/index.ts'),
-  handler: 'handler',
-  runtime: lambda.Runtime.NODEJS_18_X,
-  timeout: cdk.Duration.seconds(30),
-  environment: {
-    // Add any config
-  }
-});
-
-// Grant agent permission to invoke Lambda
-actionLambda.grantInvoke(
-  new iam.ServicePrincipal('bedrock.amazonaws.com')
-);
-```
-
-#### 3. Define OpenAPI Schema
-
-```typescript
-// lib/action-schema.ts
-export const actionGroupSchema = {
-  openapi: '3.0.0',
-  info: {
-    title: 'Custom Actions API',
-    version: '1.0.0',
-    description: 'Custom tools for the RAG agent'
-  },
-  paths: {
-    '/get_pricing': {
-      post: {
-        description: 'Get pricing information for a specific tier',
-        operationId: 'get_pricing',
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': {
-              schema: {
-                type: 'object',
-                properties: {
-                  tier: {
-                    type: 'string',
-                    description: 'The pricing tier (basic, pro, enterprise)',
-                    enum: ['basic', 'pro', 'enterprise']
-                  }
-                },
-                required: ['tier']
-              }
-            }
-          }
-        },
-        responses: {
-          '200': {
-            description: 'Successful response',
-            content: {
-              'application/json': {
-                schema: {
-                  type: 'object',
-                  properties: {
-                    tier: { type: 'string' },
-                    price: { type: 'number' },
-                    currency: { type: 'string' }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    '/check_status': {
-      post: {
-        description: 'Check the operational status of a service',
-        operationId: 'check_status',
-        requestBody: {
-          required: true,
-          content: {
-            'application/json': {
-              schema: {
-                type: 'object',
-                properties: {
-                  service: {
-                    type: 'string',
-                    description: 'The service name to check'
-                  }
-                },
-                required: ['service']
-              }
-            }
-          }
-        },
-        responses: {
-          '200': {
-            description: 'Successful response'
-          }
-        }
-      }
-    }
-  }
-};
-```
-
-#### 4. Create Action Group
-
-```typescript
-// In bedrock-agent-construct.ts or stack
-const createActionGroup = new cr.AwsCustomResource(this, 'CreateActionGroup', {
-  onCreate: {
-    service: 'BedrockAgent',
-    action: 'createAgentActionGroup',
-    parameters: {
-      agentId: agent.agentId,
-      agentVersion: 'DRAFT',
-      actionGroupName: 'custom-tools',
-      actionGroupExecutor: {
-        lambda: actionLambda.functionArn
-      },
-      apiSchema: {
-        payload: JSON.stringify(actionGroupSchema)
-      },
-      description: 'Custom tools for pricing and status checks'
-    }
-  },
-  onDelete: {
-    service: 'BedrockAgent',
-    action: 'deleteAgentActionGroup',
-    parameters: {
-      agentId: agent.agentId,
-      agentVersion: 'DRAFT',
-      actionGroupId: new cr.PhysicalResourceIdReference()
-    }
-  },
-  policy: cr.AwsCustomResourcePolicy.fromStatements([
-    new iam.PolicyStatement({
-      effect: iam.Effect.ALLOW,
-      actions: [
-        'bedrock:CreateAgentActionGroup',
-        'bedrock:DeleteAgentActionGroup'
-      ],
-      resources: ['*']
-    })
-  ])
-});
-```
-
-#### 5. Update Agent Instructions
-
-```typescript
-instruction: `You are a helpful assistant with access to:
-
-1. Knowledge base - for documentation and guides
-2. Custom tools:
-   - get_pricing(tier): Get pricing for a tier
-   - check_status(service): Check service status
-
-When users ask about pricing or status, use the appropriate tool.
-
-Example:
-User: "How much does the Pro plan cost?"
-You: [Use get_pricing tool with tier="pro"]
-     "The Pro plan costs $50 USD per month."
-`
-```
-
-### Testing Custom Tools
-
-```bash
-# Redeploy with new action group
-cdk deploy
-
-# Test pricing query
-npm run test-agent
-
-# Ask: "What's the price for enterprise?"
-# Agent should invoke Lambda and return: "$200 USD"
-```
-
-## API Gateway Integration
-
-Expose your agent via REST API.
-
-### Architecture
-
-```
-Client → API Gateway → Lambda → Bedrock Agent → Response
-                         ↓
-                   DynamoDB (sessions)
-```
-
-### Implementation
-
-#### 1. Create API Lambda
-
-```typescript
-// lambda/api/index.ts
-import {
-  BedrockAgentRuntimeClient,
-  InvokeAgentCommand
-} from '@aws-sdk/client-bedrock-agent-runtime';
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
-
-const bedrockClient = new BedrockAgentRuntimeClient({});
-const dynamoClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-
-const AGENT_ID = process.env.AGENT_ID!;
-const ALIAS_ID = process.env.ALIAS_ID!;
-const SESSIONS_TABLE = process.env.SESSIONS_TABLE!;
-
-export const handler = async (event: any) => {
-  const body = JSON.parse(event.body);
-  const { message, userId } = body;
-
-  if (!message || !userId) {
-    return {
-      statusCode: 400,
-      body: JSON.stringify({ error: 'Missing message or userId' })
-    };
-  }
-
-  // Get or create session
-  let sessionId = await getSession(userId);
-  if (!sessionId) {
-    sessionId = `session-${userId}-${Date.now()}`;
-    await saveSession(userId, sessionId);
-  }
-
-  // Invoke agent
-  try {
-    const response = await bedrockClient.send(new InvokeAgentCommand({
-      agentId: AGENT_ID,
-      agentAliasId: ALIAS_ID,
-      sessionId,
-      inputText: message
-    }));
-
-    let fullResponse = '';
-    const citations = [];
-
-    for await (const event of response.completion) {
-      if (event.chunk?.bytes) {
-        fullResponse += new TextDecoder().decode(event.chunk.bytes);
-      }
-      if (event.chunk?.attribution?.citations) {
-        citations.push(...event.chunk.attribution.citations);
-      }
-    }
-
-    return {
-      statusCode: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      },
-      body: JSON.stringify({
-        response: fullResponse,
-        citations,
-        sessionId
-      })
-    };
-  } catch (error) {
-    console.error('Error:', error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: 'Internal server error' })
-    };
-  }
-};
-
-async function getSession(userId: string): Promise<string | null> {
-  const result = await dynamoClient.send(new GetCommand({
-    TableName: SESSIONS_TABLE,
-    Key: { userId }
-  }));
-  return result.Item?.sessionId || null;
-}
-
-async function saveSession(userId: string, sessionId: string): Promise<void> {
-  await dynamoClient.send(new PutCommand({
-    TableName: SESSIONS_TABLE,
-    Item: {
-      userId,
-      sessionId,
-      createdAt: new Date().toISOString()
-    }
-  }));
-}
-```
-
-#### 2. Add API to CDK Stack
-
-```typescript
-// lib/s3-rag-stack.ts
-import * as apigateway from 'aws-cdk-lib/aws-apigateway';
-import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
-
-// Create sessions table
-const sessionsTable = new dynamodb.Table(this, 'SessionsTable', {
-  partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
-  billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-  removalPolicy: cdk.RemovalPolicy.DESTROY
-});
-
-// Create API Lambda
-const apiLambda = new nodejs.NodejsFunction(this, 'ApiLambda', {
-  entry: path.join(__dirname, '../lambda/api/index.ts'),
-  handler: 'handler',
-  runtime: lambda.Runtime.NODEJS_18_X,
-  timeout: cdk.Duration.seconds(60),
-  environment: {
-    AGENT_ID: agent.agentId,
-    ALIAS_ID: agent.agentAliasId!,
-    SESSIONS_TABLE: sessionsTable.tableName
-  }
-});
-
-// Grant permissions
-sessionsTable.grantReadWriteData(apiLambda);
-apiLambda.addToRolePolicy(new iam.PolicyStatement({
-  effect: iam.Effect.ALLOW,
-  actions: ['bedrock:InvokeAgent'],
-  resources: [agent.agentArn]
-}));
-
-// Create API Gateway
-const api = new apigateway.RestApi(this, 'AgentApi', {
-  restApiName: 'RAG Agent API',
-  description: 'API for RAG agent',
-  defaultCorsPreflightOptions: {
-    allowOrigins: apigateway.Cors.ALL_ORIGINS,
-    allowMethods: apigateway.Cors.ALL_METHODS
-  }
-});
-
-const chat = api.root.addResource('chat');
-chat.addMethod('POST', new apigateway.LambdaIntegration(apiLambda));
-
-// Output API endpoint
-new cdk.CfnOutput(this, 'ApiEndpoint', {
-  value: api.url,
-  description: 'API Gateway endpoint'
-});
-```
-
-#### 3. Client Usage
-
-```typescript
-// Frontend client
-async function chatWithAgent(message: string, userId: string) {
-  const response = await fetch('https://YOUR_API_ID.execute-api.us-east-1.amazonaws.com/prod/chat', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      message,
-      userId
-    })
-  });
-
-  const data = await response.json();
-  return data;
-}
-
-// Usage
-const result = await chatWithAgent('What is RAG?', 'user-123');
-console.log(result.response);
-console.log(result.citations);
-```
+> **A note on action groups.** Earlier versions of this chapter covered Bedrock Agent action groups - Lambda-backed tools the agent could call. That surface belongs to [Bedrock Agents Classic, which closed to new customers on July 30, 2026](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-classic-maintenance-mode.html). If you need tool-calling agents, the section on [AgentCore](#when-you-actually-need-an-agent) at the end of this chapter is the current path.
 
 ## Guardrails
 
-Add content filtering and safety controls.
+Bedrock Guardrails apply content filtering, denied topics, and PII handling to model interactions, independent of your prompt template. A prompt template is a request; a guardrail is enforcement.
 
-### Creating Guardrails
+### Creating one
+
+```bash
+aws bedrock create-guardrail \
+  --name rag-tutorial-guardrail \
+  --description "Content safety for the RAG assistant" \
+  --blocked-input-messaging "I can't help with that request." \
+  --blocked-outputs-messaging "I can't provide that information." \
+  --content-policy-config '{
+    "filtersConfig": [
+      {"type":"HATE","inputStrength":"HIGH","outputStrength":"HIGH"},
+      {"type":"INSULTS","inputStrength":"HIGH","outputStrength":"HIGH"},
+      {"type":"SEXUAL","inputStrength":"HIGH","outputStrength":"HIGH"},
+      {"type":"VIOLENCE","inputStrength":"HIGH","outputStrength":"HIGH"},
+      {"type":"PROMPT_ATTACK","inputStrength":"HIGH","outputStrength":"NONE"}
+    ]
+  }' \
+  --topic-policy-config '{
+    "topicsConfig": [{
+      "name": "LegalAdvice",
+      "definition": "Requests for legal advice or interpretation of contracts",
+      "examples": ["Can I sue over this policy?", "Is this contract enforceable?"],
+      "type": "DENY"
+    }]
+  }' \
+  --sensitive-information-policy-config '{
+    "piiEntitiesConfig": [
+      {"type":"EMAIL","action":"ANONYMIZE"},
+      {"type":"PHONE","action":"ANONYMIZE"},
+      {"type":"US_SOCIAL_SECURITY_NUMBER","action":"BLOCK"}
+    ]
+  }'
+```
+
+`PROMPT_ATTACK` is worth calling out: it targets prompt injection, which matters here because retrieved document text goes into the prompt. **A document in your corpus is untrusted input** if anyone but you can add documents to that bucket.
+
+### Applying it
+
+`RetrieveAndGenerate` accepts a guardrail on the generation configuration:
 
 ```typescript
-// lib/guardrails-construct.ts
+generationConfiguration: {
+  promptTemplate: { textPromptTemplate: PROMPT_TEMPLATE },
+  guardrailConfiguration: {
+    guardrailId: 'abc123',
+    guardrailVersion: '1',
+  },
+}
+```
+
+Wire the IDs through as Lambda environment variables the same way `PROMPT_TEMPLATE` is, so changing them is a redeploy rather than a code edit.
+
+### Managing guardrails in CDK
+
+`AWS::Bedrock::Guardrail` and `AWS::Bedrock::GuardrailVersion` are native CloudFormation resources, so a guardrail can live in this stack alongside everything else:
+
+```typescript
 import * as bedrock from 'aws-cdk-lib/aws-bedrock';
 
-export class GuardrailsConstruct extends Construct {
-  public readonly guardrailId: string;
-
-  constructor(scope: Construct, id: string) {
-    super(scope, id);
-
-    const guardrail = new bedrock.CfnGuardrail(this, 'Guardrail', {
-      name: 'rag-agent-guardrail',
-      description: 'Content filtering for RAG agent',
-      blockedInputMessaging: 'I cannot process that type of request.',
-      blockedOutputsMessaging: 'I cannot provide that information.',
-
-      // Content filters
-      contentPolicyConfig: {
-        filtersConfig: [
-          {
-            type: 'SEXUAL',
-            inputStrength: 'HIGH',
-            outputStrength: 'HIGH'
-          },
-          {
-            type: 'VIOLENCE',
-            inputStrength: 'HIGH',
-            outputStrength: 'HIGH'
-          },
-          {
-            type: 'HATE',
-            inputStrength: 'HIGH',
-            outputStrength: 'HIGH'
-          },
-          {
-            type: 'INSULTS',
-            inputStrength: 'MEDIUM',
-            outputStrength: 'MEDIUM'
-          },
-          {
-            type: 'MISCONDUCT',
-            inputStrength: 'MEDIUM',
-            outputStrength: 'MEDIUM'
-          },
-          {
-            type: 'PROMPT_ATTACK',
-            inputStrength: 'HIGH',
-            outputStrength: 'NONE'
-          }
-        ]
-      },
-
-      // Topic filters
-      topicPolicyConfig: {
-        topicsConfig: [
-          {
-            name: 'financial-advice',
-            definition: 'Requests for financial or investment advice',
-            examples: [
-              'Should I invest in stocks?',
-              'What should I do with my money?'
-            ],
-            type: 'DENY'
-          },
-          {
-            name: 'medical-advice',
-            definition: 'Requests for medical diagnosis or treatment advice',
-            examples: [
-              'Do I have cancer?',
-              'What medication should I take?'
-            ],
-            type: 'DENY'
-          }
-        ]
-      },
-
-      // Word filters
-      wordPolicyConfig: {
-        wordsConfig: [
-          { text: 'example-blocked-word' }
-        ],
-        managedWordListsConfig: [
-          { type: 'PROFANITY' }
-        ]
-      },
-
-      // PII redaction
-      sensitiveInformationPolicyConfig: {
-        piiEntitiesConfig: [
-          {
-            type: 'EMAIL',
-            action: 'ANONYMIZE'
-          },
-          {
-            type: 'PHONE',
-            action: 'ANONYMIZE'
-          },
-          {
-            type: 'CREDIT_DEBIT_CARD_NUMBER',
-            action: 'BLOCK'
-          },
-          {
-            type: 'US_SOCIAL_SECURITY_NUMBER',
-            action: 'BLOCK'
-          }
-        ]
-      }
-    });
-
-    this.guardrailId = guardrail.attrGuardrailId;
-  }
-}
-```
-
-### Attach to Agent
-
-```typescript
-// In agent construct
-const guardrail = new GuardrailsConstruct(this, 'Guardrails');
-
-// Associate with agent (via custom resource)
-const attachGuardrail = new cr.AwsCustomResource(this, 'AttachGuardrail', {
-  onCreate: {
-    service: 'BedrockAgent',
-    action: 'updateAgent',
-    parameters: {
-      agentId: this.agentId,
-      guardrailConfiguration: {
-        guardrailIdentifier: guardrail.guardrailId,
-        guardrailVersion: 'DRAFT'
-      }
-    }
-  }
+const guardrail = new bedrock.CfnGuardrail(this, 'Guardrail', {
+  name: `rag-guardrail-${deploymentId}`,
+  blockedInputMessaging: "I can't help with that request.",
+  blockedOutputsMessaging: "I can't provide that information.",
+  contentPolicyConfig: { /* as above */ },
 });
 ```
 
-## Streaming with WebSockets
+## Multiple knowledge bases
 
-Real-time streaming for better UX.
-
-### Architecture
-
-```
-Client ←WebSocket→ API Gateway WebSocket → Lambda → Bedrock Agent
-                                              ↓
-                                      Stream chunks back
-```
-
-### Implementation
+The `KnowledgeBaseConstruct` takes a `dataPrefix`, so partitioning the corpus is straightforward:
 
 ```typescript
-// lambda/websocket/index.ts
-import {
-  ApiGatewayManagementApiClient,
-  PostToConnectionCommand
-} from '@aws-sdk/client-apigatewaymanagementapi';
-
-export const handler = async (event: any) => {
-  const { requestContext, body } = event;
-  const { connectionId, domainName, stage } = requestContext;
-
-  const apiGwClient = new ApiGatewayManagementApiClient({
-    endpoint: `https://${domainName}/${stage}`
-  });
-
-  const { message } = JSON.parse(body);
-
-  // Invoke agent with streaming
-  const response = await bedrockClient.send(new InvokeAgentCommand({
-    agentId: AGENT_ID,
-    agentAliasId: ALIAS_ID,
-    sessionId: connectionId,
-    inputText: message
-  }));
-
-  // Stream chunks to client
-  for await (const event of response.completion) {
-    if (event.chunk?.bytes) {
-      const text = new TextDecoder().decode(event.chunk.bytes);
-
-      await apiGwClient.send(new PostToConnectionCommand({
-        ConnectionId: connectionId,
-        Data: JSON.stringify({ type: 'chunk', data: text })
-      }));
-    }
-  }
-
-  // Send completion
-  await apiGwClient.send(new PostToConnectionCommand({
-    ConnectionId: connectionId,
-    Data: JSON.stringify({ type: 'complete' })
-  }));
-
-  return { statusCode: 200, body: 'Message sent' };
-};
-```
-
-## Multi-Modal RAG
-
-Support images and other media types.
-
-### PDF Processing
-
-```typescript
-// lambda/pdf-processor/index.ts
-import { PDFDocument } from 'pdf-lib';
-import * as pdfParse from 'pdf-parse';
-
-export const handler = async (event: any) => {
-  const { s3 } = event.Records[0];
-  const bucket = s3.bucket.name;
-  const key = s3.object.key;
-
-  // Download PDF
-  const pdfBuffer = await s3Client.send(new GetObjectCommand({
-    Bucket: bucket,
-    Key: key
-  }));
-
-  // Extract text
-  const data = await pdfParse(pdfBuffer.Body);
-
-  // Upload as text for ingestion
-  await s3Client.send(new PutObjectCommand({
-    Bucket: bucket,
-    Key: key.replace('.pdf', '.txt'),
-    Body: data.text,
-    Metadata: {
-      'source-document': key,
-      'page-count': data.numpages.toString()
-    }
-  }));
-};
-```
-
-## Advanced Patterns
-
-### Pattern 1: Multi-Agent System
-
-```typescript
-// Different agents for different domains
-const supportAgent = new BedrockAgentConstruct(this, 'SupportAgent', {
-  agentName: 'support-agent',
-  knowledgeBaseId: supportKB.knowledgeBaseId,
-  instruction: 'You handle customer support...'
+const financeKb = new KnowledgeBaseConstruct(this, 'FinanceKb', {
+  dataBucket,
+  dataPrefix: 'Financial-Data/',
+  knowledgeBaseName: `kb-fin-${this.account}-${deploymentId}`,
 });
 
-const technicalAgent = new BedrockAgentConstruct(this, 'TechnicalAgent', {
-  agentName: 'technical-agent',
-  knowledgeBaseId: technicalKB.knowledgeBaseId,
-  instruction: 'You handle technical questions...'
+const hrKb = new KnowledgeBaseConstruct(this, 'HrKb', {
+  dataBucket,
+  dataPrefix: 'Human-Resources/',
+  knowledgeBaseName: `kb-hr-${this.account}-${deploymentId}`,
 });
-
-// Router lambda decides which agent to use
 ```
 
-### Pattern 2: Hybrid Search
+Each gets its own vector bucket, index, role, and data source.
+
+**When this is worth it:**
+
+- **Access control** - finance documents shouldn't be retrievable by everyone. Separate knowledge bases mean separate IAM.
+- **Independent ingestion** - re-indexing HR documents doesn't touch finance.
+- **Different tuning** - legal text may want 1500-token chunks while an FAQ wants 200.
+
+**When it isn't:** if you only want the model to *prefer* a category, metadata filtering on one knowledge base is simpler and cheaper. Each knowledge base carries its own storage and its own ingestion runs.
+
+Routing across several knowledge bases means your Lambda decides which to query - by explicit user selection, by a cheap classification call, or by querying several and merging. That routing logic is yours to write; it is exactly the job an agent used to do.
+
+## Metadata filtering at scale
+
+[Chapter 04](04-customization.md#metadata-filtering) covers the mechanics. Two things matter once the corpus grows:
+
+**Keep filterable attributes small.** S3 Vectors allows 40KB of metadata per vector but only **2KB filterable**. Use short scalar keys - `category`, `year`, `dept` - not prose.
+
+**Filter for security, not just relevance.** If different users may see different documents, apply the filter server-side in the Lambda based on the authenticated identity. A filter set by the browser is a suggestion, not a control:
 
 ```typescript
-// Combine vector search with keyword search
-async function hybridSearch(query: string) {
-  // Vector search
-  const vectorResults = await bedrockRuntime.retrieve({
-    knowledgeBaseId: KB_ID,
-    retrievalQuery: { text: query },
-    retrievalConfiguration: {
-      vectorSearchConfiguration: {
-        numberOfResults: 5,
-        overrideSearchType: 'SEMANTIC'
-      }
-    }
-  });
+// Derive from the verified token, never from the request body.
+const allowedDepts = claimsFromVerifiedJwt(event).departments;
 
-  // Keyword search (OpenSearch)
-  const keywordResults = await opensearch.search({
-    index: 'documents',
-    body: {
-      query: {
-        match: { content: query }
-      }
-    }
-  });
-
-  // Merge and re-rank
-  return mergeResults(vectorResults, keywordResults);
-}
+filter: { in: { key: 'dept', value: allowedDepts } }
 ```
 
-### Pattern 3: Feedback Loop
+## Reranking
+
+Vector search optimises for embedding similarity, which is not identical to answer relevance. A reranking model re-scores the retrieved chunks against the original question before generation.
+
+The pattern: retrieve a wider net (say 20 chunks), rerank, keep the best 5, generate. It costs an extra model call and buys noticeably better precision on corpora with many near-duplicate passages.
+
+Bedrock supports reranking through `retrieveAndGenerateConfiguration`; availability varies by Region and model. See [Supported Regions and models for reranking](https://docs.aws.amazon.com/bedrock/latest/userguide/rerank-supported.html).
+
+## Hybrid search
+
+Pure semantic search can miss exact-token matches - error codes, SKUs, function names, proper nouns. Hybrid search combines vector similarity with keyword matching:
 
 ```typescript
-// Collect user feedback
-interface Feedback {
-  sessionId: string;
-  query: string;
-  response: string;
-  rating: number;
-  comment?: string;
-}
-
-async function saveFeedback(feedback: Feedback) {
-  await dynamodb.putItem({
-    TableName: 'AgentFeedback',
-    Item: feedback
-  });
-
-  // Trigger retraining if rating < 3
-  if (feedback.rating < 3) {
-    await sqs.sendMessage({
-      QueueUrl: REVIEW_QUEUE_URL,
-      MessageBody: JSON.stringify(feedback)
-    });
-  }
+vectorSearchConfiguration: {
+  numberOfResults: 5,
+  overrideSearchType: 'HYBRID',
 }
 ```
+
+Support depends on the vector store, and not every store implements it. Check current S3 Vectors capability before depending on it; if it isn't available and exact-match retrieval matters to you, that is a legitimate reason to choose OpenSearch Serverless despite the cost.
+
+## Streaming responses
+
+`RetrieveAndGenerate` returns a complete answer. For token-by-token output there is `RetrieveAndGenerateStream`.
+
+The current UI fakes it: the Lambda returns the whole answer and `web/app/page.tsx` animates it character by character. That's honest enough for a tutorial and much simpler, but it means time-to-first-character equals total generation time.
+
+Real streaming through this architecture requires replacing API Gateway REST + Lambda proxy integration, which buffers the entire response. Options:
+
+- **Lambda function URL** with `RESPONSE_STREAM` invoke mode
+- **API Gateway WebSocket API**
+- **AppSync** subscriptions
+
+Each is a meaningful rearchitecture of [lib/web-hosting-construct.ts](../lib/web-hosting-construct.ts), which is why the tutorial doesn't do it.
+
+## Multi-modal documents
+
+Bedrock Knowledge Bases can parse images and complex layouts inside PDFs using a **foundation model as parser** rather than plain text extraction. Claude and Nova vision models can be used for this, which is what makes charts and scanned tables retrievable.
+
+Configure it on the data source's `vectorIngestionConfiguration.parsingConfiguration`. This costs more at ingestion - every page goes through a vision model - so it earns its place on document sets where the information genuinely lives in the figures.
+
+See [Parsing options for your data source](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-advanced-parsing.html).
+
+## A feedback loop
+
+Answer quality is not observable without feedback. A minimal version:
+
+1. Add thumbs up/down to the UI
+2. Log the question, the retrieved chunk URIs, the answer, and the rating
+3. Review the negatives weekly
+
+Downvotes cluster into two causes, and they need different fixes:
+
+- **The right chunks weren't retrieved** → chunking, embeddings, `numberOfResults`, filtering
+- **The right chunks were retrieved but the answer was poor** → prompt template or model
+
+Logging the retrieved URIs alongside the rating is what lets you tell those apart. Without it you're guessing.
+
+## When you actually need an agent
+
+Everything above is retrieval and generation. An **agent** is different: it decides which tools to call, in what order, and loops until it has an answer - querying an API, running code, writing to a system of record.
+
+Bedrock Agents Classic did this, and is closed to new customers as of July 30, 2026. Its replacement is **[Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html)**, which offers:
+
+- A **managed harness** - declare model, tools, and instructions; AWS runs the loop, memory, identity, and observability
+- **Code-defined agents** - deploy your own orchestration on AgentCore runtime using any framework
+- **Gateway** - exposes REST APIs, Lambdas, and code-level tools as MCP tools
+- **Gateway-fronted knowledge base integration** - the knowledge base you built in this tutorial plugs straight in
+
+That last point is the useful part: **nothing in this tutorial is wasted if you later want an agent.** The knowledge base, the vector index, and the ingestion pipeline are the same resources; AgentCore consumes them through a retrieval tool.
+
+The `AWS::BedrockAgentCore::*` CloudFormation resources are public, so an AgentCore deployment can be defined in CDK alongside this stack.
+
+Before reaching for one, though: if your use case is "answer questions about my documents," you already have the right architecture. An agent adds latency, cost, and failure modes in exchange for tool use you may not need.
 
 ## Summary
 
-You've learned:
-
-✅ Custom action groups with Lambda
-✅ API Gateway integration
-✅ Guardrails for safety
-✅ WebSocket streaming
-✅ Multi-modal RAG
-✅ Advanced patterns
+- **Guardrails** enforce safety independently of the prompt - and matter more once documents are untrusted input
+- **Multiple knowledge bases** buy access-control and ingestion isolation, at the cost of duplicated infrastructure
+- **Metadata filtering** must be applied server-side when it's doing security work
+- **Reranking and hybrid search** improve retrieval precision for specific corpus shapes
+- **True streaming** needs a different API surface than REST + Lambda proxy
+- **AgentCore** is where to go if you need tools and orchestration - and it reuses this knowledge base
 
 ## Resources
 
-- [Bedrock Agents Developer Guide](https://docs.aws.amazon.com/bedrock/latest/userguide/agents.html)
-- [Action Groups Documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-action.html)
-- [Guardrails Guide](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html)
-- [API Gateway WebSocket](https://docs.aws.amazon.com/apigateway/latest/developerguide/apigateway-websocket-api.html)
+- [Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html)
+- [Knowledge base parsing options](https://docs.aws.amazon.com/bedrock/latest/userguide/kb-advanced-parsing.html)
+- [Reranking support](https://docs.aws.amazon.com/bedrock/latest/userguide/rerank-supported.html)
+- [Bedrock AgentCore developer guide](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html)
+- [Agents Classic maintenance mode](https://docs.aws.amazon.com/bedrock/latest/userguide/agents-classic-maintenance-mode.html)
 
-## Congratulations!
+## Next steps
 
-You've completed the S3 RAG with Amazon Bedrock Agents tutorial! You now have the knowledge to build production-ready RAG systems.
-
-**What's Next?**
-- Build your own RAG application
-- Experiment with different models
-- Integrate with your existing systems
-- Share your learnings with the community
-
-Happy building!
+→ **[Step 7: The Web Interface](07-web-interface.md)** - how the UI, API Gateway, and Lambda fit together.

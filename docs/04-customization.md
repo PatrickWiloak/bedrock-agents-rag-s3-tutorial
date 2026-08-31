@@ -1,685 +1,362 @@
-# Step 4: Customizing Your Agent
+# Step 4: Customization
 
-Learn how to tailor your RAG agent to your specific use case through various customization options.
+Four levers control answer quality: the prompt template, the model, the chunking strategy, and retrieval depth. This chapter covers each, and which ones require re-ingestion.
 
-## Agent Personality & Instructions
+## What requires re-ingestion
 
-The agent's instruction is its "system prompt" - defining its role, capabilities, and constraints.
+Get this straight before changing anything - it determines how expensive an experiment is.
 
-### Basic Template
+| Change | Redeploy | Re-ingest | Index replaced |
+|---|---|---|---|
+| Prompt template | ✅ | – | – |
+| Generation model | ✅ | – | – |
+| `numberOfResults` | ✅ | – | – |
+| Chunk size / overlap | ✅ | ✅ | – |
+| Embedding model | ✅ | ✅ | ✅ |
+| Embedding dimension | ✅ | ✅ | ✅ |
 
-```typescript
-instruction: `You are a [ROLE].
+The first three are cheap to iterate on. The last three mean rebuilding the vector store.
 
-Capabilities:
-- [What it can do]
-- [What resources it has access to]
+## Answer style: the prompt template
 
-Responsibilities:
-- [Primary task 1]
-- [Primary task 2]
+This is the `RetrieveAndGenerate` equivalent of an agent's instructions, and the highest-leverage thing you can change. It lives in `PROMPT_TEMPLATE` in [lib/s3-rag-stack.ts](../lib/s3-rag-stack.ts).
+
+### The one hard rule
+
+**The template must contain `$search_results$`.** Bedrock replaces that placeholder with the retrieved chunks. Leave it out and the model receives no context and answers from training data alone - which is exactly the failure mode RAG exists to prevent.
+
+### Basic shape
+
+```
+You are <role> for <organisation>. You answer questions using the documents below.
+
+Here are the search results:
+$search_results$
+
+How to respond:
+- Answer only from the search results above. If they do not contain the answer, say so plainly rather than guessing.
+- Name the document an answer came from.
+- Be specific: include dates, amounts, percentages, policy details.
+```
+
+### Example: customer support
+
+```
+You are a support assistant for Acme Software. Answer using only the
+documentation below.
+
+Here are the search results:
+$search_results$
 
 Guidelines:
-- [How to respond]
-- [What to avoid]
-- [When to escalate]
-
-Response format: [Structure of answers]
-Tone: [Formal/Casual/Technical]
-`
+- Give the shortest correct answer, then offer to go deeper.
+- Always link the doc page you used.
+- If the answer is not in the results, say "I don't have documentation on
+  that - I'd suggest contacting support@acme.com" and stop.
+- Never speculate about pricing, contractual terms, or security posture.
 ```
 
-### Example 1: Customer Support Bot
+### Example: technical documentation
 
-```typescript
-const agent = new BedrockAgentConstruct(this, 'SupportAgent', {
-  agentName: 'customer-support-agent',
-  instruction: `You are a customer support specialist for TechCorp's SaaS platform.
+```
+You are a documentation assistant for the Acme API.
 
-**Your Knowledge Base:**
-You have access to our complete product documentation, FAQs, and troubleshooting guides.
+Here are the search results:
+$search_results$
 
-**Your Role:**
-- Help customers resolve issues quickly
-- Provide clear, step-by-step instructions
-- Escalate complex technical issues
-- Never make promises about features or timelines
-
-**Response Guidelines:**
-1. Always search the knowledge base first
-2. If found: Provide detailed answer with steps
-3. If not found: "I don't have information about that. Let me connect you with our technical team."
-4. Include relevant links when available
-5. Ask clarifying questions if needed
-
-**Response Format:**
-- Start with a brief summary
-- Provide numbered steps for procedures
-- End with "Is there anything else I can help you with?"
-
-**Tone:** Professional but warm and empathetic
-`,
-  foundationModel: 'anthropic.claude-3-sonnet-20240229-v1:0',
-});
+Guidelines:
+- Prefer code examples over prose. Use fenced blocks with the right language tag.
+- State the API version an example applies to.
+- Flag deprecated parameters explicitly.
+- If the results conflict, say so and cite both.
 ```
 
-### Example 2: Technical Documentation Assistant
+### Making it stop inventing answers
 
-```typescript
-instruction: `You are a technical documentation expert for our API platform.
+If the model answers questions the documents don't cover, the template is too permissive. Effective additions:
 
-**Your Expertise:**
-- API endpoints and parameters
-- Authentication methods
-- Code examples
-- Error messages and troubleshooting
+- "Answer **only** from the search results above."
+- "If the search results do not contain the answer, reply exactly: 'That isn't covered in the documents I have access to.'"
+- "Do not use general knowledge. Do not speculate."
 
-**Response Style:**
-- Precise and technical
-- Include code snippets when relevant
-- Cite specific API versions
-- Provide working examples
+### Applying a change
 
-**Format:**
-\`\`\`
-## [Topic]
-**Description:** [Brief explanation]
-**Example:**
-[Code block]
-**Parameters:**
-- param1: [description]
-\`\`\`
-
-**Tone:** Technical and authoritative
-`,
-  foundationModel: 'anthropic.claude-3-opus-20240229-v1:0',
-});
-```
-
-### Example 3: Internal Knowledge Assistant
-
-```typescript
-instruction: `You are the company knowledge assistant.
-
-**Your Purpose:**
-Help employees quickly find information from:
-- Company policies
-- HR guidelines
-- IT procedures
-- Office information
-
-**Boundaries:**
-- Only answer from documented policies
-- For sensitive HR matters: "Please contact HR directly at hr@company.com"
-- For IT issues requiring access: "Please submit a ticket at support.company.com"
-- Never speculate on policy changes
-
-**Response Format:**
-- Quote relevant policy sections
-- Provide policy document names
-- Include last updated dates when available
-
-**Tone:** Helpful and neutral
-`,
-  foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0',
-});
-```
-
-## Foundation Model Selection
-
-Choose based on your requirements:
-
-### Performance Comparison
-
-| Model | Use Case | Latency | Cost | Quality |
-|-------|----------|---------|------|---------|
-| Claude 3 Haiku | FAQ, simple queries | Fast | $ | Good |
-| Claude 3 Sonnet | General purpose | Medium | $$ | Great |
-| Claude 3 Opus | Complex analysis | Slow | $$$ | Best |
-
-### When to Use Each
-
-**Haiku:**
-```typescript
-foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0'
-```
-- High volume, simple queries
-- FAQ bots
-- Cost-sensitive applications
-- Real-time chat
-
-**Sonnet (Recommended):**
-```typescript
-foundationModel: 'anthropic.claude-3-sonnet-20240229-v1:0'
-```
-- General-purpose RAG
-- Balanced performance/cost
-- Most use cases
-- Good reasoning
-
-**Opus:**
-```typescript
-foundationModel: 'anthropic.claude-3-opus-20240229-v1:0'
-```
-- Complex technical questions
-- Research assistance
-- High-stakes applications
-- Best quality required
-
-### Switching Models
-
-Update in `lib/s3-rag-stack.ts`:
-
-```typescript
-const agent = new BedrockAgentConstruct(this, 'BedrockAgent', {
-  // Change this line:
-  foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0',
-  // ...other config
-});
-```
-
-Then redeploy:
 ```bash
-cdk deploy
+cdk deploy      # prompt template lives in the Lambda's environment
+npm run test-rag
 ```
 
-The agent will automatically be prepared with the new model.
+No re-ingestion needed.
 
-## Document Chunking Strategy
+## Model selection
 
-### Understanding Chunking
+### Choosing at deploy time
 
-Chunking splits documents for optimal retrieval:
-
-```
-Original Document (2000 tokens)
-        ↓
-┌─────────────────┐
-│ Chunk 1 (300)   │ ← Tokens 1-300
-├─────────────────┤
-│ Overlap (20)    │ ← Shared context
-├─────────────────┤
-│ Chunk 2 (300)   │ ← Tokens 281-580
-├─────────────────┤
-│ Overlap (20)    │
-├─────────────────┤
-│ Chunk 3 (300)   │ ← Tokens 561-860
-└─────────────────┘
+```bash
+cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ```
 
-### Customizing Chunk Size
+Or change `DEFAULT_MODEL_ID` in [lib/s3-rag-stack.ts](../lib/s3-rag-stack.ts).
 
-In `lib/s3-rag-stack.ts`:
+### The options
+
+| Model ID | Character |
+|---|---|
+| `us.anthropic.claude-opus-5` | Default. Best reasoning and synthesis across multiple documents. |
+| `us.anthropic.claude-sonnet-5` | Strong quality, meaningfully cheaper than Opus. |
+| `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Fastest and cheapest. Good for straightforward lookup questions. |
+
+Check what your account can actually reach:
+
+```bash
+aws bedrock list-inference-profiles --region us-east-1 \
+  --query "inferenceProfileSummaries[?contains(inferenceProfileId, 'claude')].[inferenceProfileId,status]" \
+  --output table
+```
+
+### Which to pick
+
+- **Lookup questions** ("what's the stipend?") - Haiku is fine and much cheaper
+- **Synthesis across documents** ("how does our PTO compare to our stated values?") - Opus or Sonnet earns its cost
+- **Working through the tutorial** - Haiku, then switch up if answers disappoint
+
+> **Remember the ID prefix.** `us.anthropic.claude-opus-5` is an inference profile; `anthropic.claude-opus-5` is the underlying foundation model. Configure the profile. The IAM policy needs both - [lib/web-hosting-construct.ts](../lib/web-hosting-construct.ts) derives the second from the first.
+
+## Chunking strategy
+
+### Why it matters
+
+Chunks are the unit of retrieval. A chunk that's too small lacks the context to be useful on its own; one that's too large drags irrelevant text into the prompt and dilutes the signal.
+
+### Changing it
+
+In [lib/s3-rag-stack.ts](../lib/s3-rag-stack.ts):
 
 ```typescript
 const knowledgeBase = new KnowledgeBaseConstruct(this, 'KnowledgeBase', {
-  dataBucket: dataBucket,
-  chunkSize: 500,      // ← Adjust this
-  chunkOverlap: 50,    // ← Adjust this
-});
-```
-
-### Chunk Size Guidelines
-
-**Small Chunks (200-300)**
-- **Pros:** Precise retrieval, lower cost
-- **Cons:** May miss context
-- **Best for:** Q&A, definitions, structured data
-
-**Medium Chunks (400-600)**
-- **Pros:** Balanced approach
-- **Cons:** None significant
-- **Best for:** Most use cases (recommended)
-
-**Large Chunks (800-1000)**
-- **Pros:** More context
-- **Cons:** Higher cost, less precise
-- **Best for:** Long-form content, narratives
-
-### Chunk Overlap
-
-Overlap prevents information loss at boundaries:
-
-```
-Chunk 1: "...the configuration file should be placed in..."
-                                              ↓ OVERLAP ↓
-Chunk 2: "...should be placed in the /etc directory with..."
-```
-
-**Guidelines:**
-- 10-20% of chunk size
-- Higher overlap = better continuity
-- Higher overlap = more storage cost
-
-**Example:**
-```typescript
-chunkSize: 500,
-chunkOverlap: 75,  // 15% overlap
-```
-
-### When to Re-chunk
-
-After changing chunk settings:
-
-```bash
-# 1. Update stack
-cdk deploy
-
-# 2. Re-run ingestion
-aws bedrock-agent start-ingestion-job \
-  --knowledge-base-id $KB_ID \
-  --data-source-id $DS_ID
-```
-
-## Embedding Model Selection
-
-### Available Models
-
-**Amazon Titan Embeddings v2** (Default)
-```typescript
-embeddingModelId: 'amazon.titan-embed-text-v2:0'
-```
-- Dimensions: 1024
-- Languages: 100+
-- Cost: $0.0001 per 1K tokens
-
-**Cohere Embed v3**
-```typescript
-embeddingModelId: 'cohere.embed-english-v3'
-```
-- Dimensions: 1024
-- Language: English
-- Cost: $0.0001 per 1K tokens
-
-### Changing Embedding Model
-
-**Important:** Requires recreating the knowledge base.
-
-```typescript
-const knowledgeBase = new KnowledgeBaseConstruct(this, 'KnowledgeBase', {
-  dataBucket: dataBucket,
-  embeddingModelId: 'cohere.embed-english-v3',  // ← Change
-  // ...
+  chunkSize: 300,               // max tokens per chunk
+  chunkOverlapPercentage: 7,    // percent of overlap between neighbours
 });
 ```
 
 Then:
+
 ```bash
-# Destroy and recreate
-cdk destroy
 cdk deploy
-
-# Re-upload and ingest
-npm run upload-docs
+npm run upload-docs     # re-ingest - existing vectors are stale
 ```
 
-## Retrieval Configuration
+### Guidelines
 
-### Runtime Settings
+| Content | Suggested chunk size |
+|---|---|
+| FAQs, short policies, structured records | 200-300 |
+| General documents (this tutorial's default) | 300-500 |
+| Narrative prose, meeting notes, long reports | 500-1000 |
+| Legal or technical text where context is everything | 1000-2000 |
 
-Configure at query time (not deployment):
+### Overlap
 
-```typescript
-const response = await client.send(new RetrieveCommand({
-  knowledgeBaseId: KB_ID,
-  retrievalQuery: { text: 'What is RAG?' },
-  retrievalConfiguration: {
-    vectorSearchConfiguration: {
-      numberOfResults: 10,           // How many chunks to retrieve
-      overrideSearchType: 'HYBRID'   // HYBRID or SEMANTIC
-    }
-  }
-}));
-```
+Overlap duplicates a little text at each boundary so a sentence spanning two chunks survives intact in at least one.
 
-### Number of Results
+- **0%** - risks losing boundary-spanning facts
+- **5-10%** - sensible default (this tutorial uses 7%)
+- **20%+** - better recall, but more vectors, more storage, more cost
 
-**Trade-offs:**
+### Other chunking strategies
 
-| Results | Pros | Cons |
-|---------|------|------|
-| 3-5 | Faster, focused | May miss relevant info |
-| 5-10 | Balanced | Standard cost |
-| 10-20 | Comprehensive | Slower, expensive |
+Bedrock also supports `NONE` (one chunk per document), `HIERARCHICAL` (parent/child chunks - retrieve the child, return the parent), and `SEMANTIC` (split at meaning boundaries). This tutorial uses `FIXED_SIZE` because it's predictable and easy to reason about. `HIERARCHICAL` is worth exploring for long structured documents.
 
-### Search Types
+## Embedding model
 
-**SEMANTIC** (Default)
-- Pure vector similarity
-- Best for conceptual matches
-- Example: "How to deploy" matches "deployment guide"
+### Options
 
-**HYBRID**
-- Combines vector + keyword search
-- Best for specific terms
-- Example: "API key" finds exact phrase
+| Model | Dimensions | Notes |
+|---|---|---|
+| `amazon.titan-embed-text-v2:0` | 256 / 512 / **1024** | Default. Good quality, low cost. |
+| `amazon.titan-embed-text-v1` | 1536 | Older generation. |
+| `cohere.embed-english-v3` | 1024 | Strong English-only performance. |
+| `cohere.embed-multilingual-v3` | 1024 | Use for non-English corpora. |
 
-### Implementation
+### Changing it
 
-In your test script:
+The embedding dimension is a **create-only** property of the S3 Vectors index, so changing it replaces the index and discards every stored vector.
 
 ```typescript
-// For specific queries
-const response = await bedrockRuntime.retrieve({
-  knowledgeBaseId,
-  retrievalQuery: { text: query },
-  retrievalConfiguration: {
-    vectorSearchConfiguration: {
-      numberOfResults: 5,
-      overrideSearchType: 'SEMANTIC'
-    }
-  }
+const knowledgeBase = new KnowledgeBaseConstruct(this, 'KnowledgeBase', {
+  embeddingModelId: 'cohere.embed-multilingual-v3',
+  embeddingDimension: 1024,     // must match the model
 });
 ```
-
-## Session Management
-
-### Session Timeout
-
-Control how long sessions stay active:
-
-```typescript
-const agent = new BedrockAgentConstruct(this, 'BedrockAgent', {
-  idleSessionTTLInSeconds: 1200,  // 20 minutes
-});
-```
-
-**Guidelines:**
-- **Short (300-600s):** Chat-like interactions
-- **Medium (600-1200s):** Standard web apps
-- **Long (1200-3600s):** Research/analysis tasks
-
-### Session Attributes
-
-Pass context with each invocation:
-
-```typescript
-const response = await client.send(new InvokeAgentCommand({
-  agentId,
-  agentAliasId,
-  sessionId,
-  inputText: query,
-  sessionState: {
-    sessionAttributes: {
-      userId: 'user-123',
-      accountTier: 'premium',
-      language: 'en-US'
-    }
-  }
-}));
-```
-
-Use in instructions:
-
-```typescript
-instruction: `You are a support agent.
-
-When responding:
-- Address user by their tier level
-- Prioritize premium users
-- Consider user's language preference
-
-Access user data via session attributes.
-`
-```
-
-## Advanced: Metadata Filtering
-
-### Adding Metadata to Documents
-
-When uploading to S3, include metadata:
-
-```typescript
-await s3Client.send(new PutObjectCommand({
-  Bucket: bucketName,
-  Key: 'docs/api-v2.md',
-  Body: fileContent,
-  Metadata: {
-    'x-amz-meta-category': 'api-docs',
-    'x-amz-meta-version': '2.0',
-    'x-amz-meta-audience': 'developers'
-  }
-}));
-```
-
-### Filtering During Retrieval
-
-```typescript
-const response = await client.send(new RetrieveCommand({
-  knowledgeBaseId,
-  retrievalQuery: { text: 'authentication' },
-  retrievalConfiguration: {
-    vectorSearchConfiguration: {
-      numberOfResults: 5,
-      filter: {
-        equals: {
-          key: 'category',
-          value: 'api-docs'
-        }
-      }
-    }
-  }
-}));
-```
-
-**Use Cases:**
-- Version-specific docs
-- Role-based access
-- Category filtering
-- Language selection
-
-## Performance Tuning
-
-### For Speed
-
-```typescript
-// Fast model
-foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0'
-
-// Smaller chunks
-chunkSize: 300
-
-// Fewer results
-// Set at runtime: numberOfResults: 3
-
-// Shorter timeout
-idleSessionTTLInSeconds: 300
-```
-
-### For Quality
-
-```typescript
-// Better model
-foundationModel: 'anthropic.claude-3-opus-20240229-v1:0'
-
-// Larger chunks
-chunkSize: 600
-chunkOverlap: 60
-
-// More results
-// Set at runtime: numberOfResults: 10
-
-// Detailed instructions
-instruction: `[Very detailed instructions...]`
-```
-
-### For Cost
-
-```typescript
-// Cheaper model
-foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0'
-
-// Smaller chunks (less storage)
-chunkSize: 300
-chunkOverlap: 15
-
-// Fewer results
-// Set at runtime: numberOfResults: 3
-
-// Amazon model for embeddings
-embeddingModelId: 'amazon.titan-embed-text-v2:0'
-```
-
-## Testing Customizations
-
-### A/B Testing
-
-Create multiple agents with different configs:
-
-```typescript
-// Agent A: Fast & cheap
-const agentA = new BedrockAgentConstruct(this, 'AgentA', {
-  agentName: 'fast-agent',
-  foundationModel: 'anthropic.claude-3-haiku-20240307-v1:0',
-});
-
-// Agent B: Quality focused
-const agentB = new BedrockAgentConstruct(this, 'AgentB', {
-  agentName: 'quality-agent',
-  foundationModel: 'anthropic.claude-3-opus-20240229-v1:0',
-});
-```
-
-### Measuring Performance
-
-```typescript
-// Measure latency
-const start = Date.now();
-const response = await invokeAgent(...);
-const latency = Date.now() - start;
-
-// Measure quality (subjective)
-const citationCount = citations.length;
-const responseLength = fullResponse.length;
-
-console.log({
-  latency,
-  citationCount,
-  responseLength,
-  model: 'claude-3-sonnet'
-});
-```
-
-## Real-World Examples
-
-### E-commerce Support
-
-```typescript
-agentName: 'product-support',
-instruction: `You help customers with product questions.
-
-Your knowledge base contains:
-- Product specifications
-- User manuals
-- Warranty information
-- Return policies
-
-Always:
-- Search KB before responding
-- Provide product links when available
-- Mention warranty terms if relevant
-- For orders/shipping: "Contact our support team at..."
-
-Tone: Friendly and helpful
-`,
-foundationModel: 'anthropic.claude-3-sonnet-20240229-v1:0',
-chunkSize: 400,
-```
-
-### Legal Document Search
-
-```typescript
-agentName: 'legal-research',
-instruction: `You are a legal research assistant.
-
-Capabilities:
-- Search case law and statutes
-- Find precedents
-- Summarize legal documents
-
-Limitations:
-- NOT a lawyer
-- Cannot provide legal advice
-- Always include disclaimers
-
-Response format:
-1. Summary of findings
-2. Relevant excerpts with citations
-3. Disclaimer: "This is not legal advice. Consult an attorney."
-
-Tone: Professional and precise
-`,
-foundationModel: 'anthropic.claude-3-opus-20240229-v1:0',
-chunkSize: 800,  // Legal docs need more context
-chunkOverlap: 100,
-```
-
-### Developer Documentation
-
-```typescript
-agentName: 'api-docs-assistant',
-instruction: `You are an API documentation expert.
-
-When users ask about our API:
-1. Provide endpoint details
-2. Show code examples
-3. Explain parameters
-4. List common errors
-
-Code format:
-\`\`\`language
-[working code example]
-\`\`\`
-
-Always cite:
-- API version
-- Documentation page
-- Last updated date
-
-Tone: Technical and clear
-`,
-foundationModel: 'anthropic.claude-3-sonnet-20240229-v1:0',
-chunkSize: 500,
-```
-
-## Deployment Workflow
-
-After customization:
 
 ```bash
-# 1. Make changes in code
-vim lib/s3-rag-stack.ts
+cdk deploy              # replaces the index
+npm run upload-docs     # rebuild every vector
+```
 
-# 2. Preview changes
-cdk diff
+**The two values must agree.** A 1024-dim index fed 1536-dim vectors fails at ingestion.
+
+## Retrieval configuration
+
+### Number of results
+
+How many chunks get pulled into the prompt. Set in [lib/s3-rag-stack.ts](../lib/s3-rag-stack.ts):
+
+```typescript
+new WebHostingConstruct(this, 'WebHosting', {
+  numberOfResults: 5,
+});
+```
+
+| Value | Effect |
+|---|---|
+| 3 | Fast and cheap. Good for narrow lookups. Risks missing context. |
+| 5 | Default. Balanced. |
+| 10 | Better for questions spanning documents. More tokens, higher cost, more noise. |
+
+More is not automatically better - irrelevant chunks actively degrade answers by diluting the useful ones.
+
+### Search type
+
+`vectorSearchConfiguration` also accepts `overrideSearchType`:
+
+- `SEMANTIC` - pure vector similarity
+- `HYBRID` - vector plus keyword matching
+
+`HYBRID` helps when exact terms matter - product codes, error strings, proper nouns - because pure semantic search can miss a literal token match. Support depends on the vector store; check current S3 Vectors capability before relying on it.
+
+## Metadata filtering
+
+You can restrict retrieval to a subset of documents by attaching metadata at ingestion and filtering at query time.
+
+### Attaching metadata
+
+Place a `.metadata.json` file alongside each document:
+
+```
+Financial-Data/budget-2025.md
+Financial-Data/budget-2025.md.metadata.json
+```
+
+```json
+{
+  "metadataAttributes": {
+    "category": "financial",
+    "year": 2025,
+    "confidential": true
+  }
+}
+```
+
+Re-ingest after adding these.
+
+### Filtering at query time
+
+```typescript
+retrievalConfiguration: {
+  vectorSearchConfiguration: {
+    numberOfResults: 5,
+    filter: {
+      andAll: [
+        { equals: { key: 'category', value: 'financial' } },
+        { greaterThanOrEquals: { key: 'year', value: 2025 } },
+      ],
+    },
+  },
+}
+```
+
+Operators include `equals`, `notEquals`, `greaterThan`, `greaterThanOrEquals`, `lessThan`, `lessThanOrEquals`, `in`, `notIn`, `startsWith`, `andAll`, `orAll`.
+
+> **The 2KB filterable-metadata limit applies here.** S3 Vectors allows 40KB of metadata per vector but only 2KB of *filterable* metadata. That's why `AMAZON_BEDROCK_TEXT` and `AMAZON_BEDROCK_METADATA` are declared non-filterable in [lib/knowledge-base-construct.ts](../lib/knowledge-base-construct.ts). Keep your own filterable attributes small and scalar.
+
+## Tuning for a goal
+
+### For speed
+
+```typescript
+modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+numberOfResults: 3,
+chunkSize: 300,
+```
+
+### For quality
+
+```typescript
+modelId: 'us.anthropic.claude-opus-5',
+numberOfResults: 8,
+chunkSize: 500,
+chunkOverlapPercentage: 15,
+```
+
+Plus a prompt template that demands citations and forbids speculation.
+
+### For cost
+
+```typescript
+modelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+numberOfResults: 3,
+chunkSize: 300,
+chunkOverlapPercentage: 5,
+```
+
+Generation dominates the bill, so the model choice and `numberOfResults` matter far more than storage settings.
+
+## Testing customizations
+
+Change one variable at a time and use a fixed question set, or you won't know what caused a difference.
+
+```bash
+# Baseline
+cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0
+npm run test-rag > /tmp/haiku.txt
+
+# Variant
+cdk deploy --context modelId=us.anthropic.claude-opus-5
+npm run test-rag > /tmp/opus.txt
+
+diff /tmp/haiku.txt /tmp/opus.txt
+```
+
+The demo questions in `scripts/test-rag.ts` are deliberately fixed so runs are comparable. Add your own to that array - questions whose correct answers you know.
+
+What to judge:
+
+- **Grounded** - is every claim actually in the cited document?
+- **Complete** - did it miss something the documents contain?
+- **Honest** - does it admit gaps rather than inventing?
+- **Cited** - are the sources the ones a human would have used?
+
+[Chapter 05](05-testing.md) goes further on evaluation.
+
+## Deployment workflow
+
+```bash
+# 1. Make the change in lib/s3-rag-stack.ts
+# 2. Preview it
+npm run diff
 
 # 3. Deploy
 cdk deploy
 
-# 4. Test
-npm run test-agent
+# 4. Re-ingest ONLY if chunking or embeddings changed
+npm run upload-docs
+npm run check-status
 
-# 5. If chunking changed, re-ingest
-aws bedrock-agent start-ingestion-job \
-  --knowledge-base-id $KB_ID \
-  --data-source-id $DS_ID
+# 5. Evaluate
+npm run test-rag
 ```
 
-## Summary Checklist
+## Summary checklist
 
-Customize your agent by considering:
+- [ ] Prompt template contains `$search_results$`
+- [ ] Prompt template tells the model to admit gaps
+- [ ] Model ID carries an inference profile prefix (`us.`, `eu.`, `apac.`, `global.`)
+- [ ] Embedding dimension matches the index dimension
+- [ ] Re-ingested after any chunking or embedding change
+- [ ] `numberOfResults` tuned against real questions, not guessed
+- [ ] Tested with questions whose answers you know
 
-- [ ] Agent instructions (role, guidelines, tone)
-- [ ] Foundation model (speed vs quality vs cost)
-- [ ] Chunk size (precision vs context)
-- [ ] Chunk overlap (continuity)
-- [ ] Embedding model (if multilingual)
-- [ ] Session timeout (use case duration)
-- [ ] Metadata filtering (if multi-tenant)
-- [ ] Retrieval settings (results count, search type)
+## Next steps
 
-## Next Steps
-
-Learn how to test and validate your customizations!
-
-→ Continue to [Step 5: Testing & Deployment](05-testing.md)
+→ **[Step 5: Testing & Production](05-testing.md)** - evaluating quality, monitoring, and hardening.

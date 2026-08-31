@@ -1,16 +1,20 @@
 /**
- * Lambda function that handles Bedrock Agent invocations via API Gateway
- * This proxies requests from the web UI to Amazon Bedrock
+ * Lambda function that answers chat requests from the web UI.
+ *
+ * It calls the Bedrock Knowledge Base `RetrieveAndGenerate` API, which does the
+ * whole RAG loop server-side in one call: embed the question, search the S3
+ * Vectors index, stuff the matching chunks into a prompt, and generate a
+ * grounded answer with citations attached.
  */
 
 import {
   BedrockAgentRuntimeClient,
-  InvokeAgentCommand,
+  RetrieveAndGenerateCommand,
 } from '@aws-sdk/client-bedrock-agent-runtime';
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 
 /**
- * Citation object structure for knowledge base references
+ * A single source document backing part of the answer.
  */
 interface Citation {
   uri: string;
@@ -21,23 +25,20 @@ const client = new BedrockAgentRuntimeClient({
   region: process.env.AWS_REGION || 'us-east-1',
 });
 
-const AGENT_ID = process.env.AGENT_ID!;
+const KNOWLEDGE_BASE_ID = process.env.KNOWLEDGE_BASE_ID!;
+const MODEL_ARN = process.env.MODEL_ARN!;
+
+/** How many chunks to retrieve per question. */
+const NUMBER_OF_RESULTS = Number(process.env.NUMBER_OF_RESULTS ?? '5');
 
 /**
- * Agent Alias ID for invoking the Bedrock Agent
+ * Optional prompt template controlling how the answer is written.
  *
- * AWS Bedrock requires an alias ID when invoking agents via InvokeAgentCommand.
- * We use 'TSTALIASID' as the default, which is AWS's built-in test alias that
- * automatically exists for all DRAFT agents.
- *
- * Why TSTALIASID?
- * - It's always available for DRAFT agents (no need to create it)
- * - Perfect for development and testing
- * - For production, you can create a custom alias via AWS Console or CDK
- *
- * Learn more: https://docs.aws.amazon.com/bedrock/latest/userguide/agents-deploy.html
+ * This is the RetrieveAndGenerate equivalent of an agent's instructions. If set
+ * it must contain the `$search_results$` placeholder, which Bedrock replaces
+ * with the retrieved chunks. Leave it unset to use Bedrock's built-in template.
  */
-const AGENT_ALIAS_ID = process.env.AGENT_ALIAS_ID || 'TSTALIASID';
+const PROMPT_TEMPLATE = process.env.PROMPT_TEMPLATE;
 
 export const handler = async (
   event: APIGatewayProxyEvent
@@ -45,20 +46,9 @@ export const handler = async (
   /**
    * CORS Headers - Required for CloudFront → API Gateway requests
    *
-   * Even though API Gateway has CORS configured via defaultCorsPreflightOptions,
-   * the Lambda function MUST return CORS headers in every response. Here's why:
-   *
-   * 1. API Gateway CORS only handles OPTIONS preflight requests
-   * 2. Actual POST/GET requests need CORS headers from the Lambda response
-   * 3. Without these headers, browsers block the response with CORS errors
-   *
-   * Headers explained:
-   * - Access-Control-Allow-Origin: Which domains can call this API
-   *   ('*' = any domain, or specify CloudFront domain for security)
-   * - Access-Control-Allow-Methods: Which HTTP methods are allowed
-   * - Access-Control-Allow-Headers: Which request headers are allowed
-   *
-   * Learn more: https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html
+   * API Gateway's CORS configuration only answers the OPTIONS preflight. The
+   * actual POST response needs these headers from the Lambda itself, or the
+   * browser discards it.
    */
   const headers = {
     'Content-Type': 'application/json',
@@ -69,25 +59,14 @@ export const handler = async (
 
   // Handle OPTIONS preflight
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 200,
-      headers,
-      body: '',
-    };
+    return { statusCode: 200, headers, body: '' };
   }
 
   try {
-    console.log('[BEDROCK] === Request Start ===');
-    console.log('[BEDROCK] Event:', JSON.stringify({
-      httpMethod: event.httpMethod,
-      path: event.path,
-      headers: event.headers,
-      body: event.body?.substring(0, 200) // First 200 chars only
-    }, null, 2));
+    console.log('[RAG] === Request Start ===');
 
-    // Parse request body
     if (!event.body) {
-      console.error('[BEDROCK] ERROR: Missing request body');
+      console.error('[RAG] ERROR: Missing request body');
       return {
         statusCode: 400,
         headers,
@@ -95,141 +74,149 @@ export const handler = async (
       };
     }
 
-    // Parse JSON with specific error handling
     let message: string;
-    let sessionId: string;
+    let sessionId: string | undefined;
     try {
       const body = JSON.parse(event.body);
       message = body.message;
       sessionId = body.sessionId;
-      console.log('[BEDROCK] Parsed request:', {
-        messageLength: message?.length || 0,
-        sessionId
-      });
     } catch (parseError) {
-      console.error('[BEDROCK] ERROR: JSON parse failed:', parseError);
+      console.error('[RAG] ERROR: JSON parse failed:', parseError);
       return {
         statusCode: 400,
         headers,
         body: JSON.stringify({
           error: 'Invalid JSON in request body',
-          message: parseError instanceof Error ? parseError.message : 'JSON parse failed'
+          message:
+            parseError instanceof Error ? parseError.message : 'JSON parse failed',
         }),
       };
     }
 
-    if (!message || !sessionId) {
-      console.error('[BEDROCK] ERROR: Missing required fields:', {
-        hasMessage: !!message,
-        hasSessionId: !!sessionId
-      });
+    if (!message) {
+      console.error('[RAG] ERROR: Missing message');
       return {
         statusCode: 400,
         headers,
-        body: JSON.stringify({ error: 'Missing message or sessionId' }),
+        body: JSON.stringify({ error: 'Missing message' }),
       };
     }
 
-    if (!AGENT_ID) {
-      console.error('[BEDROCK] ERROR: AGENT_ID not configured');
+    if (!KNOWLEDGE_BASE_ID || !MODEL_ARN) {
+      console.error('[RAG] ERROR: KNOWLEDGE_BASE_ID or MODEL_ARN not configured');
       return {
         statusCode: 500,
         headers,
         body: JSON.stringify({
-          error: 'Server configuration error. AGENT_ID not set',
+          error: 'Server configuration error. KNOWLEDGE_BASE_ID or MODEL_ARN not set',
         }),
       };
     }
 
-    console.log('[BEDROCK] Configuration:', {
-      agentId: AGENT_ID,
-      agentAliasId: AGENT_ALIAS_ID,
+    console.log('[RAG] Configuration:', {
+      knowledgeBaseId: KNOWLEDGE_BASE_ID,
+      modelArn: MODEL_ARN,
       region: process.env.AWS_REGION,
+      hasSession: Boolean(sessionId),
     });
 
-    // Invoke Bedrock Agent with streaming
-    const command = new InvokeAgentCommand({
-      agentId: AGENT_ID,
-      agentAliasId: AGENT_ALIAS_ID,
-      sessionId,
-      inputText: message,
-    });
-
-    console.log('[BEDROCK] Invoking agent...');
-    const response = await client.send(command);
-    console.log('[BEDROCK] Agent invoked successfully');
-
-    // Collect streaming response
-    let fullResponse = '';
-    const citations: Citation[] = [];
-    const decoder = new TextDecoder(); // Create once, reuse for all chunks
-    let chunkCount = 0;
-
-    if (response.completion) {
-      console.log('[BEDROCK] Processing completion stream...');
-      for await (const event of response.completion) {
-        if (event.chunk?.bytes) {
-          const text = decoder.decode(event.chunk.bytes);
-          fullResponse += text;
-          chunkCount++;
-        }
-
-        // Collect citations
-        if (event.trace?.trace?.orchestrationTrace?.observation?.knowledgeBaseLookupOutput) {
-          const kbOutput =
-            event.trace.trace.orchestrationTrace.observation.knowledgeBaseLookupOutput;
-          if (kbOutput.retrievedReferences) {
-            console.log('[BEDROCK] Found KB references:', kbOutput.retrievedReferences.length);
-            kbOutput.retrievedReferences.forEach((ref) => {
-              if (ref.location?.s3Location?.uri) {
-                citations.push({
-                  uri: ref.location.s3Location.uri,
-                  text: ref.content?.text || '',
-                });
+    /**
+     * Session handling
+     *
+     * RetrieveAndGenerate issues its own session IDs and uses them to keep
+     * conversation history server-side. Only ever send back one that Bedrock
+     * gave us - passing a client-invented ID is rejected with a validation
+     * error, so the first request in a conversation must omit it entirely.
+     */
+    const command = new RetrieveAndGenerateCommand({
+      input: { text: message },
+      ...(sessionId ? { sessionId } : {}),
+      retrieveAndGenerateConfiguration: {
+        type: 'KNOWLEDGE_BASE',
+        knowledgeBaseConfiguration: {
+          knowledgeBaseId: KNOWLEDGE_BASE_ID,
+          modelArn: MODEL_ARN,
+          retrievalConfiguration: {
+            vectorSearchConfiguration: {
+              numberOfResults: NUMBER_OF_RESULTS,
+            },
+          },
+          ...(PROMPT_TEMPLATE
+            ? {
+                generationConfiguration: {
+                  promptTemplate: { textPromptTemplate: PROMPT_TEMPLATE },
+                },
               }
-            });
-          }
-        }
+            : {}),
+        },
+      },
+    });
+
+    console.log('[RAG] Calling RetrieveAndGenerate...');
+    const response = await client.send(command);
+
+    const answer = response.output?.text ?? '';
+
+    /**
+     * Citations
+     *
+     * The response groups references by the span of generated text they
+     * support. We flatten them into a single list for the UI and drop
+     * duplicates, since the same document often backs several spans.
+     */
+    const citations: Citation[] = [];
+    const seen = new Set<string>();
+
+    for (const citation of response.citations ?? []) {
+      for (const ref of citation.retrievedReferences ?? []) {
+        const uri = ref.location?.s3Location?.uri;
+        if (!uri || seen.has(uri)) continue;
+        seen.add(uri);
+        citations.push({ uri, text: ref.content?.text ?? '' });
       }
     }
 
-    console.log('[BEDROCK] Response complete:', {
-      responseLength: fullResponse.length,
-      chunkCount,
-      citationCount: citations.length
+    console.log('[RAG] Response complete:', {
+      responseLength: answer.length,
+      citationCount: citations.length,
     });
-    console.log('[BEDROCK] === Request End ===');
+    console.log('[RAG] === Request End ===');
 
     return {
       statusCode: 200,
       headers,
       body: JSON.stringify({
-        response: fullResponse,
+        response: answer,
         citations,
-        sessionId,
+        // Hand the session ID back so the browser can continue the conversation.
+        sessionId: response.sessionId,
       }),
     };
   } catch (error: any) {
-    console.error('[BEDROCK] === ERROR ===');
-    console.error('[BEDROCK] Error type:', error.constructor.name);
-    console.error('[BEDROCK] Error code:', error.code || error.$metadata?.httpStatusCode);
-    console.error('[BEDROCK] Error message:', error.message);
-    console.error('[BEDROCK] Full error:', JSON.stringify({
-      name: error.name,
-      message: error.message,
-      code: error.code,
-      statusCode: error.$metadata?.httpStatusCode,
-      requestId: error.$metadata?.requestId,
-    }, null, 2));
+    console.error('[RAG] === ERROR ===');
+    console.error('[RAG] Error type:', error?.constructor?.name);
+    console.error('[RAG] Error message:', error?.message);
+    console.error(
+      '[RAG] Full error:',
+      JSON.stringify(
+        {
+          name: error?.name,
+          message: error?.message,
+          statusCode: error?.$metadata?.httpStatusCode,
+          requestId: error?.$metadata?.requestId,
+        },
+        null,
+        2
+      )
+    );
 
     return {
-      statusCode: error.$metadata?.httpStatusCode || 500,
+      statusCode: error?.$metadata?.httpStatusCode || 500,
       headers,
       body: JSON.stringify({
-        error: 'Failed to invoke agent',
-        message: error.message,
-        code: error.code || error.name,
-        details: error.$fault || 'Unknown error'
+        error: 'Failed to query the knowledge base',
+        message: error?.message,
+        code: error?.name,
       }),
     };
   }

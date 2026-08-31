@@ -7,27 +7,27 @@
     "build": "next build",
     "export": "next build",
     "start": "next start",
-    "lint": "next lint",
-    "setup": "bash scripts/setup-env.sh"
+    "lint": "eslint",
+    "setup": "bash scripts/setup-local-config.sh"
   },
   "dependencies": {
-    "@aws-sdk/client-bedrock-agent-runtime": "^3.470.0",
-    "@aws-sdk/client-cloudformation": "^3.470.0",
-    "next": "^15.1.6",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "react-markdown": "^9.0.1"
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.1121.0",
+    "@aws-sdk/client-cloudformation": "^3.1121.0",
+    "next": "^16.3.3",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0"
   },
   "devDependencies": {
     "@tailwindcss/typography": "^0.5.19",
-    "@types/node": "^20",
+    "@types/node": "^22.10.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "autoprefixer": "^10.4.16",
     "eslint": "^9",
-    "eslint-config-next": "^15.1.6",
+    "eslint-config-next": "^16.3.3",
     "postcss": "^8.4.32",
-    "tailwindcss": "^3.4.0",
+    "tailwindcss": "^3.4.17",
     "typescript": "^5"
   }
 }

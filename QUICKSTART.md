@@ -1,244 +1,200 @@
 # Quick Start Guide
 
-Get your **multi-knowledge-base RAG agent** running in less than 10 minutes!
+Get a working RAG system running in about 10 minutes of wall-clock time (plus ~5 minutes of waiting for ingestion).
+
+For the full explanation of what you're building, start with [README.md](README.md).
 
 ## What Gets Deployed
 
-This tutorial deploys a complete RAG system with:
-- **1 S3 Data Bucket** with organized sample documents
-- **1 S3 Vector Bucket** - serverless vector database (NEW!)
-- **1 Vector Index** - enables fast similarity search
-- **1 Knowledge Base** - manages document ingestion and embeddings
-- **1 Bedrock Agent** - Claude 3.5 Haiku with knowledge base access
-- **Sample Documents** - 17 realistic company documents (financial reports, HR policies, meeting notes)
+- **S3 bucket** with 17 sample company documents in three folders
+- **S3 Vectors** vector bucket and index (serverless vector database)
+- **Bedrock Knowledge Base** wired to that index
+- **Lambda + API Gateway** exposing a `/chat` endpoint backed by `RetrieveAndGenerate`
+- **CloudFront + S3** serving a Next.js chat UI
+
+No Bedrock Agent is involved - see [What changed in v2](README.md#-what-changed-in-v2-august-2026).
 
 ## Prerequisites
 
-**Required software installed:**
-- AWS Account with Bedrock access enabled
-- Node.js 18+ installed
-- AWS CLI configured
-- CDK CLI: `npm install -g aws-cdk`
+```bash
+node --version     # need 20+
+aws --version
+cdk --version      # npm install -g aws-cdk
+docker info        # must be running - CDK bundles the Lambda in a container
+jq --version       # used by test-bedrock.sh
+aws sts get-caller-identity   # credentials must work
+```
 
-**Not set up yet?** → Watch this [AWS Account & User Setup Tutorial](https://www.youtube.com/watch?v=DuUmIMW0Xr0) for step-by-step guidance on configuring your AWS account and CLI credentials
-
----
+You also need the IAM permissions in [iam-policy.json](iam-policy.json) - see [Required IAM Permissions](README.md#required-iam-permissions).
 
 ## About Bedrock Model Access
 
-**Good news!** AWS Bedrock now automatically enables access to most foundation models, including Claude 3.5 Haiku (used by default) and Amazon Titan Embeddings v2.
+Bedrock grants access to most models automatically, but some need a one-time use-case submission (usually approved in 1-2 business days).
 
-**Note:** Some newer models (like Claude Sonnet 4.5) may require first-time users to submit use case details. Claude 3.5 Haiku typically works immediately without additional approval steps.
+The default model is `us.anthropic.claude-opus-5`. Check what your account can reach:
 
-If you encounter model access issues during deployment, see the "Foundation Model Selection" section in the main README for alternatives.
+```bash
+aws bedrock list-inference-profiles --region us-east-1 \
+  --query "inferenceProfileSummaries[?contains(inferenceProfileId, 'claude')].[inferenceProfileId,status]" \
+  --output table
+```
+
+Note the `us.` prefix: every current Claude model on Bedrock is served through a cross-Region **inference profile**, not as a plain on-demand foundation model.
+
+To use a cheaper, faster model for the tutorial:
+
+```bash
+cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0
+```
 
 ## Installation & Deployment
 
+### The fast path
+
 ```bash
-# Clone the repository
 git clone https://github.com/PatrickWiloak/bedrock-agents-rag-s3-tutorial.git
 cd bedrock-agents-rag-s3-tutorial
-
-# Deploy infrastructure only
 ./deploy.sh
-
-# Then manually upload documents
-npm run upload-docs
 ```
 
-**Time:** ~15 minutes + manual upload step
+That does everything below and prints your CloudFront URL at the end.
+
+### The manual path
+
+```bash
+# Install dependencies (root + web workspace)
+npm install
+
+# Build the static web export - the stack uploads web/out
+npm run build:web
+
+# First time in this account/Region only
+cdk bootstrap
+
+# Deploy (5-8 minutes)
+cdk deploy
+```
 
 ## Upload Documents
 
+Uploading to S3 does **not** trigger indexing on its own. This script uploads and then starts the ingestion job:
+
 ```bash
-# Upload sample documents and trigger ingestion
 npm run upload-docs
-
-# You'll see:
-# ✓ Uploaded 17 documents to S3
-# ✓ Knowledge Base ingestion started
-
-# Wait 5-8 minutes for ingestion to complete
 ```
 
-The script uploads all documents to S3 and triggers ingestion for the knowledge base.
-All documents from the three folders are indexed together in a single knowledge base with S3 Vectors
+```
+✓ Uploaded 17 documents to S3
+✓ Knowledge Base ingestion started
+```
 
-## Test Your Agent
+Ingestion takes 2-5 minutes. Watch it:
 
 ```bash
-# Interactive chat
-npm run test-agent
+npm run check-status
 ```
 
-**Try these domain-specific questions:**
+Wait for `Status: ✅ COMPLETE` before querying.
 
-Financial Data:
-- "What was our Q4 2024 revenue?"
-- "What's the 2025 budget for engineering?"
-- "What's the expense policy for business travel?"
-- "What's our DSO (Days Sales Outstanding)?"
+## Query Your Knowledge Base
 
-Human Resources:
-- "What are our PTO benefits?"
-- "How much is the home office stipend?"
-- "What's the remote work policy?"
-- "Explain the performance review rating scale"
+```bash
+# Scripted demo questions across all three categories
+npm run test-rag
 
-Meeting Notes:
-- "What are the company's top priorities for 2025?"
-- "What features are planned for Q1?"
-- "What were the action items from the executive meeting?"
-- "What was discussed in the sprint retrospective?"
+# Ask your own
+npm run test-rag interactive
+```
 
-**Cross-domain questions** (agent searches multiple KBs):
-- "How many employees do we plan to hire this year?" (Budget + Meeting Notes)
-- "What's our company's approach to remote work and related costs?" (HR + Financial)
+```
+❓ You: What's our remote work policy?
+
+🤖 According to the Remote Work Policy, Nobler Works operates a hybrid model...
+
+📚 Sources:
+  1. s3://docs-.../Human-Resources/remote-work-policy.md
+```
+
+Or open the CloudFront URL from the stack outputs:
+
+```bash
+aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`WebsiteURL`].OutputValue' --output text
+```
 
 ## What You Just Built
 
-**Infrastructure:**
-- 1 S3 data bucket with organized document folders
-- 1 S3 Vector bucket + index (serverless vector database)
-- 1 Bedrock Knowledge Base (indexes all documents)
-- 1 Bedrock Agent with knowledge base access
-- Agent responses with citations
+A complete RAG pipeline:
 
-**Sample Data:**
-- 17 realistic company documents
-- Financial reports, budgets, expense policies
-- Employee handbook, benefits guide, HR policies
-- Executive meetings, product plans, sprint retros
+1. Documents in S3, chunked at 300 tokens with 7% overlap
+2. Chunks embedded by Titan Text Embeddings V2 into 1024-dimension vectors
+3. Vectors stored in an S3 Vectors index with cosine distance
+4. Questions embedded the same way, matched against the index
+5. Top 5 chunks passed to Claude with a prompt template
+6. A grounded answer returned with citations back to the source documents
 
-**Single Knowledge Base with Organized Data:**
-All documents are indexed together in one knowledge base, organized by folders. The agent can search across all domains to answer questions!
+All of it defined in ~350 lines of CDK across three constructs.
 
 ## Next Steps
 
-1. **Add your own documents**
-   ```bash
-   # Add to the appropriate knowledge base folder
-   aws s3 cp my-financial-report.pdf s3://YOUR-BUCKET-NAME/Financial-Data/
-   aws s3 cp my-policy.md s3://YOUR-BUCKET-NAME/Human-Resources/
-   aws s3 cp my-meeting-notes.md s3://YOUR-BUCKET-NAME/Meeting-Notes/
+- **Add your own documents**
 
-   # Re-run to ingest new docs
-   npm run upload-docs
-   ```
+  ```bash
+  aws s3 cp my-doc.pdf "s3://$(aws cloudformation describe-stacks \
+    --stack-name S3VectorRAGStack \
+    --query 'Stacks[0].Outputs[?OutputKey==`DataBucketName`].OutputValue' \
+    --output text)/Financial-Data/"
+  npm run upload-docs    # re-runs ingestion
+  ```
 
-2. **Add a new knowledge base domain**
-   - Edit `lib/s3-rag-stack.ts`
-   - Add new entry to `knowledgeBases` array
-   - Update agent instructions
-   - Redeploy: `cdk deploy`
-
-3. **Customize the agent**
-   - Edit `lib/s3-rag-stack.ts` - change model, instructions, chunk size
-   - Edit `lib/knowledge-base-construct.ts` - adjust embedding model, chunk overlap
-   - Edit `lib/bedrock-agent-construct.ts` - modify agent behavior
-   - Redeploy: `cdk deploy`
-
-4. **Build a web UI**
-   - See [docs/07-web-interface.md](docs/07-web-interface.md)
-   - Next.js app with dark mode, citations, chat interface
-   - Run: `cd web && npm run dev` (dependencies already installed at root)
-
-5. **Learn more**
-   - Read [docs/01-understanding.md](docs/01-understanding.md) for fundamentals
-   - Follow the full tutorial in the [docs/](docs/) folder
-   - Explore multi-KB patterns and best practices
+- **Change how it answers** - edit `PROMPT_TEMPLATE` in [lib/s3-rag-stack.ts](lib/s3-rag-stack.ts), then `cdk deploy`
+- **Tune retrieval** - `numberOfResults`, chunk size, overlap; see [docs/04-customization.md](docs/04-customization.md)
+- **Read the tutorial** - [docs/01-understanding.md](docs/01-understanding.md) onward
 
 ## Troubleshooting
 
-### "Model access denied" or "AccessDeniedException"
-→ See "Foundation Model Selection" in README.md for alternative models that don't require use case submission (e.g., Amazon Nova Pro)
+Run the diagnostic first - it checks each layer in order and stops at the real failure:
 
-### "Agent says 'I don't have that information'"
-→ Wait for ingestion to complete. Check status:
 ```bash
-aws bedrock-agent list-ingestion-jobs \
-  --knowledge-base-id YOUR_KB_ID \
-  --data-source-id YOUR_DS_ID
+./test-bedrock.sh
 ```
 
-### "Stack deployment fails"
-→ Check you have sufficient AWS permissions and Bedrock is available in your region
+| Symptom | Cause and fix |
+|---|---|
+| `AccessDeniedException` mentioning a model | Model access not enabled. Bedrock console → **Model access**. Note the error may name a Region you didn't configure - that's the inference profile routing, not a mistake. |
+| `ValidationException` about `sessionId` | A client-generated session ID was sent. Only ever send back one Bedrock issued. |
+| "I don't have that information" | Ingestion hasn't finished, or finished with failures. Run `npm run check-status`. |
+| Ingestion fails: `metadata must have at most 2048 bytes` | The index is missing its `nonFilterableMetadataKeys`. See [ARCHITECTURE.md](ARCHITECTURE.md#ingestion-flow). |
+| `cdk deploy` fails bundling the Lambda | Docker isn't running. |
+| Web UI says "Application not deployed" | `config.json` missing from the website bucket - re-run `cdk deploy` after `npm run build:web`. |
+| Stack fails on bucket name already exists | Redeploy with a fresh ID: `cdk deploy --context deploymentId=$(date -u +%y%m%d-%H%M)` |
 
 ## Clean Up
 
-When done testing:
+Everything is native CloudFormation, so one command removes all of it:
 
 ```bash
-# Destroy all resources to avoid charges
-cdk destroy
-
-# Confirm with 'y'
+npm run destroy      # or: cdk destroy
 ```
 
-**Important**: OpenSearch Serverless costs ~$0.24/hour, so destroy when not in use!
+Confirm with `y`.
 
-## Cost Estimate & Cleanup
+### Cost estimate
 
-**For completing this tutorial:**
-- S3: < $0.01
-- S3 Vectors: < $0.10 (pay-per-request)
-- Bedrock: ~$1-5 (depending on usage)
-- **Total**: ~$1-5
+Roughly **$1-5 total** for working through the tutorial, almost all of it model inference. Switching to `us.anthropic.claude-haiku-4-5-20251001-v1:0` cuts the generation cost substantially.
 
-### ⚠️ CRITICAL: Delete Resources to Avoid Ongoing Costs!
+Idle cost after deployment is close to zero - S3 Vectors bills per request and per GB stored rather than for provisioned capacity - but **delete the stack when you're done anyway**.
 
-**When you're done, follow the manual cleanup steps in the main README:**
+Verify nothing is left:
 
-👉 **[See README.md Cleanup Section](README.md#two-cleanup-options)** for detailed step-by-step instructions
-
-**Why manual cleanup?**
-- ❌ `cdk destroy` is unreliable with S3 Vectors (preview feature)
-- ❌ Automated scripts may leave orphaned resources
-- ✅ Manual deletion works 100% of the time
-- ✅ Takes 3-5 minutes following the guide
-
-**Verify cleanup worked:**
-1. Check AWS Console: https://console.aws.amazon.com/cloudformation
-2. Verify no S3 buckets: https://s3.console.aws.amazon.com/s3/buckets
-3. Check Cost Explorer after 24-48 hours: https://console.aws.amazon.com/cost-management/home#/cost-explorer
+```bash
+aws cloudformation describe-stacks --stack-name S3VectorRAGStack   # should error
+aws s3vectors list-vector-buckets --region us-east-1
+aws bedrock-agent list-knowledge-bases --region us-east-1
+```
 
 ## Support
 
-- Tutorial issues: Check [docs/](docs/) folder
-- AWS Bedrock: [Documentation](https://docs.aws.amazon.com/bedrock/)
-- CDK: [AWS CDK Guide](https://docs.aws.amazon.com/cdk/)
-
-## Architecture Diagram
-
-```
-┌─────────────┐
-│ Your Query  │
-└──────┬──────┘
-       │
-       v
-┌─────────────────────┐
-│ Bedrock Agent       │ ← Claude 3.5 Haiku
-│ (with citations)    │
-└──────┬──────────────┘
-       │
-       v
-┌─────────────────────┐
-│ Knowledge Base      │ ← Searches documents
-└──────┬──────────────┘
-       │
-       v
-┌─────────────────────┐
-│ S3 Vector Database  │ ← Serverless, up to 90% cheaper!
-│ (Embeddings)        │
-└──────┬──────────────┘
-       │
-       v
-┌─────────────────────┐
-│ S3 Documents        │ ← Your data
-│ - getting-started.md│
-│ - api-reference.md  │
-│ - customization.md  │
-└─────────────────────┘
-```
-
-Happy building with RAG! 🚀
+- [README.md](README.md) - full documentation
+- [ARCHITECTURE.md](ARCHITECTURE.md) - request flow and IAM detail
+- [docs/](docs/) - the seven-chapter tutorial

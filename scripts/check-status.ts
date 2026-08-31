@@ -117,8 +117,8 @@ async function checkIngestionStatus() {
 
       // Show status-specific messages
       if (status === 'COMPLETE') {
-        console.log('✅ Ingestion complete! Your agent is ready to use.');
-        console.log('   Run "npm run test-agent" to test it.\n');
+        console.log('✅ Ingestion complete! Your knowledge base is ready to query.');
+        console.log('   Run "npm run test-rag" to query it.\n');
       } else if (status === 'IN_PROGRESS' || status === 'STARTING') {
         console.log('⏳ Ingestion in progress. This usually takes 2-5 minutes.');
         console.log('   Run this command again to check status.\n');

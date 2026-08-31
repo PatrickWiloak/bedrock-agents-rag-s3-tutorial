@@ -19,10 +19,13 @@ export default function Home() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [currentResponse, setCurrentResponse] = useState('');
 
-  // Initialize sessionId only on client to avoid hydration mismatch
-  useEffect(() => {
-    setSessionId(`session-${Date.now()}`);
-  }, []);
+  /**
+   * Session ID
+   *
+   * RetrieveAndGenerate issues its own session IDs and uses them to hold
+   * conversation history server-side. A browser-invented ID is rejected, so
+   * this stays empty until the first response comes back with one.
+   */
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -64,7 +67,7 @@ export default function Home() {
 
       // If no config.json, show helpful error
       if (!apiEndpoint) {
-        throw new Error('Application not deployed. Please deploy the stack with: ./deploy-complete.sh');
+        throw new Error('Application not deployed. Please deploy the stack with: ./deploy.sh');
       }
 
       /**
@@ -85,7 +88,8 @@ export default function Home() {
         },
         body: JSON.stringify({
           message: input,
-          sessionId,
+          // Omitted on the first request of a conversation.
+          ...(sessionId ? { sessionId } : {}),
         }),
       });
 
@@ -100,6 +104,11 @@ export default function Home() {
       // Simulate typing effect for better UX
       const fullResponse = data.response || '';
       const citations = data.citations?.map((c: any) => c.uri) || [];
+
+      // Thread the next question onto the same conversation.
+      if (data.sessionId) {
+        setSessionId(data.sessionId);
+      }
 
       // Animate the response character by character
       for (let i = 0; i <= fullResponse.length; i++) {
@@ -388,7 +397,7 @@ export default function Home() {
             </button>
           </form>
           <p className="text-xs text-gray-500 mt-2 text-center">
-            Session ID: {sessionId}
+            Session ID: {sessionId || 'not started'}
           </p>
         </div>
       </div>

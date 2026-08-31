@@ -1,6 +1,14 @@
-*.js
-!jest.config.js
-*.d.ts
+# Compiled CDK output sits next to its TypeScript sources.
+# Scoped deliberately: a bare "*.js" here also swallowed web/next.config.js and
+# web/postcss.config.js, so the web UI could not be built from a fresh clone.
+/bin/*.js
+/bin/*.d.ts
+/lib/*.js
+/lib/*.d.ts
+/lambda/*.js
+/lambda/*.d.ts
+/scripts/*.js
+/scripts/*.d.ts
 node_modules
 
 # CDK asset staging directory
