@@ -1,4 +1,38 @@
+<div align="center">
+
+<a href="https://noblerworks.com/"><img src="https://raw.githubusercontent.com/NoblerWorks-HQ/IRONSIGHT/main/nobler-works-banner.JPG" alt="Nobler Works" width="240"></a>
+
+### Built by [Patrick Wiloak](https://patrickwiloak.com) at [Nobler Works](https://noblerworks.com/)
+
+We build custom software and products at Nobler Works. Open source projects and tutorials like this one are our way of giving back - we're nothing without the community that supports us.<br>
+If you need custom software built, [get in touch](https://noblerworks.com/).
+
+[![Website](https://img.shields.io/badge/Website-000000?style=for-the-badge&logo=googlechrome&logoColor=white)](https://noblerworks.com/)
+[![X](https://img.shields.io/badge/X-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/Nobler_Works)
+[![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/@NoblerWorks)
+[![TikTok](https://img.shields.io/badge/TikTok-000000?style=for-the-badge&logo=tiktok&logoColor=white)](https://www.tiktok.com/@noblerworks)
+[![Threads](https://img.shields.io/badge/Threads-000000?style=for-the-badge&logo=threads&logoColor=white)](https://www.threads.com/@noblerworks)
+
+</div>
+
+---
+
+<div align="center">
+
 # AWS Bedrock RAG Tutorial with S3 Vectors
+
+**Build a retrieval-augmented Q&A agent on Amazon Bedrock Knowledge Bases and S3 Vectors -
+one CDK command, a Next.js UI, and the debugging tools to see what the retriever actually returned.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-3d5a80?style=flat-square)](LICENSE)
+[![AWS Bedrock](https://img.shields.io/badge/AWS-Bedrock-FF9900?style=flat-square&logo=amazonaws&logoColor=white)](https://aws.amazon.com/bedrock/)
+[![AWS CDK](https://img.shields.io/badge/IaC-AWS%20CDK-FF9900?style=flat-square&logo=amazonaws&logoColor=white)](https://aws.amazon.com/cdk/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Deploy time](https://img.shields.io/badge/deploy-%3C10%20min-2f7757?style=flat-square)](#quick-start)
+![Cost vs OpenSearch](https://img.shields.io/badge/vs%20OpenSearch-up%20to%2090%25%20cheaper-2f7757?style=flat-square)
+
+</div>
+
 
 > **Tutorial:** Build a Q&A agent with AWS Bedrock Agents, Knowledge Bases, and S3 Vectors (preview). Includes CDK deployment, web UI, and comprehensive debugging tools.
 
