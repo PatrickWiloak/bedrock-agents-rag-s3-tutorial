@@ -1,37 +1,41 @@
 # RAG Chat Web UI
 
-The Next.js front end for the [Bedrock RAG tutorial](../README.md). A chat interface over a Bedrock Knowledge Base, with markdown rendering, dark mode, and citations.
+The Next.js front end for the [Bedrock RAG tutorial](../README.md). A streaming chat interface over a Bedrock Knowledge Base, with markdown rendering and citations.
 
 For the full explanation of how it fits together, see [docs/07-web-interface.md](../docs/07-web-interface.md).
 
 ## Features
 
-- Chat interface with markdown rendering and syntax highlighting
-- Source citations linking back to the S3 documents that grounded each answer
+- **Token-by-token streaming** - answers appear as the model writes them
+- Markdown rendering with syntax highlighting
+- Citations resolved to readable document titles, with expandable excerpts
 - Multi-turn conversations via Bedrock-issued session IDs
-- Dark mode
-- Responsive layout
+- Quick-start suggestions spanning all three document categories
+- A clear banner when the API isn't reachable, instead of a silent failure
 - **Fully static** - no server side, no secrets in the browser
 
 ## How it works
 
-This is a **static export** (`output: 'export'` in [next.config.ts](next.config.ts)). There are no Next.js route handlers and no server runtime. CDK uploads the built output to S3 and serves it through CloudFront.
+This is a **static export** (`output: 'export'` in [next.config.ts](next.config.ts)). There are no Next.js route handlers and no server runtime.
+
+The chat API lives on the **same origin**: CloudFront serves the static site from S3 by default, and routes `/api/*` to a streaming Lambda Function URL.
 
 ```
 Browser
-  │ 1. GET /              ──► CloudFront ──► S3 (Origin Access Control)
-  │ 2. GET /config.json   ──► CloudFront ──► S3
-  │ 3. POST {apiEndpoint}/chat ──► API Gateway ──► Lambda ──► Bedrock
+  │ GET /                ──► CloudFront ──► S3 (Origin Access Control)
+  │ POST /api/chat       ──► CloudFront ──► Lambda Function URL (OAC, RESPONSE_STREAM)
+  │                                              └──► Bedrock RetrieveAndGenerateStream
+  └─◄ NDJSON stream: session · text · text · citation · … · done
 ```
 
-The API Gateway URL doesn't exist until the stack deploys, so it can't be baked into the build. Instead CDK writes a `config.json` next to the site at deploy time, and the browser reads it at runtime.
+Because the API is same-origin there is **no endpoint to discover at runtime, no `config.json`, and no CORS**. The browser POSTs to a relative path.
 
-All AWS credentials live in the Lambda's IAM role. Nothing sensitive reaches the browser.
+All AWS credentials live in the Lambda's IAM role. Nothing sensitive reaches the browser, and neither origin is publicly callable - both sit behind Origin Access Control.
 
 ## Prerequisites
 
-- Node.js 20+
-- The CDK stack deployed (see the [root README](../README.md)) if you want a working backend
+- Node.js 20+ (22 recommended; see [`.nvmrc`](../.nvmrc))
+- The CDK stack deployed (see the [root README](../README.md))
 
 ## Quick start
 
@@ -41,8 +45,14 @@ From the repository root:
 
 ```bash
 npm install
-npm run build:web     # produces web/out
-cdk deploy            # uploads web/out and writes config.json
+./scripts/deploy.sh frontend     # builds web/out and redeploys it
+```
+
+Or manually:
+
+```bash
+npm run build:web
+npx cdk deploy
 ```
 
 **Build before deploying.** `cdk deploy` fails at synthesis if `web/out` doesn't exist.
@@ -50,8 +60,7 @@ cdk deploy            # uploads web/out and writes config.json
 Get your URL:
 
 ```bash
-aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`WebsiteURL`].OutputValue' --output text
+./scripts/deploy.sh status
 ```
 
 ### Local development
@@ -60,88 +69,85 @@ aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
 npm run dev --workspace=web     # http://localhost:3000
 ```
 
-The dev server has no `config.json`, so sending a message shows "Application not deployed". To develop against your deployed backend, create one:
+The layout, styling, and quick starters all work. **Sending a message will not**, because `/api/chat` only exists on the CloudFront distribution - the dev server has no such route. The UI detects this and shows a banner explaining it rather than failing silently.
 
-```bash
-mkdir -p web/public
-API=$(aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' --output text)
-echo "{\"apiEndpoint\":\"$API\"}" > web/public/config.json
-```
-
-Hot reload works normally.
+This is a deliberate trade. The previous design injected an API URL at deploy time and fetched it from `config.json`, which made local development marginally easier at the cost of a runtime lookup, a CORS configuration, and a URL-joining bug. Same-origin is the better arrangement; developing the chat loop itself is best done against a deployed stack.
 
 ## Project structure
 
 ```
 web/
-├── next.config.ts        # output: 'export', images unoptimized
-├── postcss.config.mjs    # Tailwind + autoprefixer
-├── tailwind.config.ts    # Theme
+├── next.config.ts          # output: 'export', images unoptimized
+├── postcss.config.mjs      # Tailwind + autoprefixer
+├── tailwind.config.ts      # Theme
 ├── app/
-│   ├── layout.tsx        # Root layout, fonts, metadata
-│   ├── page.tsx          # The entire chat interface
-│   └── globals.css       # Tailwind directives
-└── out/                  # Build output (gitignored) - what CDK uploads
+│   ├── layout.tsx          # Root layout, fonts, metadata
+│   ├── page.tsx            # Chat interface + NDJSON stream parser
+│   ├── globals.css         # Tailwind directives
+│   ├── lib/
+│   │   └── types.ts        # Citation, Message, StreamEvent
+│   └── components/
+│       ├── Citations.tsx           # Expandable sources with excerpts
+│       ├── QuickStarters.tsx       # Suggested opening questions
+│       └── MisconfiguredBanner.tsx # Shown when /api/chat is unreachable
+└── out/                    # Build output (gitignored) - what CDK uploads
 ```
 
 ## Key implementation details
 
-### Session IDs come from the server
+### Parsing the NDJSON stream
 
-`RetrieveAndGenerate` issues session IDs and keeps conversation history server-side. A client-invented ID is rejected with a `ValidationException`, so `sessionId` starts empty and is only ever set from a response:
+The Lambda emits one JSON object per line. Network chunks don't respect line boundaries, so the trailing partial line is buffered until the rest arrives:
 
-```typescript
-const [sessionId, setSessionId] = useState('');
+```ts
+buffer += decoder.decode(value, { stream: true });
+const lines = buffer.split('\n');
+buffer = lines.pop() ?? '';     // keep the incomplete tail
 
-// Omitted on the first request of a conversation
-body: JSON.stringify({
-  message: input,
-  ...(sessionId ? { sessionId } : {}),
-}),
-
-if (data.sessionId) setSessionId(data.sessionId);
-```
-
-### Trailing-slash normalisation
-
-API Gateway stage URLs end with `/`. Appending `/chat` naively produces `/prod//chat`, which fails as a CORS error that looks like a permissions problem:
-
-```typescript
-const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
-```
-
-### The typing effect is cosmetic
-
-The full answer arrives in one response; the UI reveals it character by character. Real token streaming needs a different API surface than API Gateway REST with Lambda proxy integration, which buffers the whole response. See [docs/06-advanced.md](../docs/06-advanced.md#streaming-responses).
-
-### API response shape
-
-```jsonc
-{
-  "response": "According to the Remote Work Policy...",
-  "citations": [{ "uri": "s3://.../remote-work-policy.md", "text": "..." }],
-  "sessionId": "issued-by-bedrock"
+for (const line of lines) {
+  if (!line.trim()) continue;
+  const event = JSON.parse(line) as StreamEvent;
+  // session | text | citation | done | error
 }
 ```
 
-Citations are already flattened and deduplicated by the Lambda.
+Dropping that `buffer = lines.pop()` line is the classic way to get intermittently mangled JSON that only shows up under load.
+
+### Accumulating outside React state
+
+Text and citations are accumulated in local variables *as well as* state. React batches state updates, so `streamingText` cannot be read back synchronously when the stream ends - the final message is built from the local accumulators.
+
+### Session IDs come from the server
+
+`RetrieveAndGenerateStream` issues session IDs and keeps conversation history server-side. A client-invented ID is rejected, so `sessionId` starts empty and is only ever set from a `session` event:
+
+```ts
+const [sessionId, setSessionId] = useState('');
+
+body: JSON.stringify({
+  message: question,
+  ...(sessionId ? { sessionId } : {}),   // omitted on the first request
+}),
+```
+
+### Citations
+
+The Lambda does the resolution - filename to friendly title, category folder, trimmed excerpt, deduplicated by URI - so the component just renders. A raw `s3://docs-…/remote-work-policy.md` doesn't tell a reader whether the answer came from the right place, which is the only reason to show a citation at all.
 
 ## Customization
 
 | What | Where |
 |---|---|
 | Theme colours | `tailwind.config.ts`, `app/globals.css` |
-| Sample questions on the welcome screen | `app/page.tsx` |
-| Message bubble styling | `app/page.tsx` |
+| Quick-start questions | `app/components/QuickStarters.tsx` |
+| Citation display | `app/components/Citations.tsx` |
+| Document titles | `TITLES` in [`lambda/chat.mjs`](../lambda/chat.mjs) - it's server-side |
 | Page title and metadata | `app/layout.tsx` |
-
-The default sample questions reference the Nobler Works sample data - change them to match your own corpus.
 
 After any change:
 
 ```bash
-npm run build:web && cdk deploy
+./scripts/deploy.sh frontend
 ```
 
 CloudFront is invalidated on every deploy (`distributionPaths: ['/*']`), so changes appear immediately.
@@ -150,31 +156,29 @@ CloudFront is invalidated on every deploy (`distributionPaths: ['/*']`), so chan
 
 | Symptom | Cause and fix |
 |---|---|
-| "Application not deployed" | `config.json` is missing. Re-run `npm run build:web && cdk deploy`, or create it locally as shown above. |
-| CORS error in the console | Look for `//chat` in the request URL, or a Lambda error response that didn't include CORS headers. |
+| "The chat API isn't reachable" | Expected under `next dev`. On a deployment, check the Lambda logs and give CloudFront a few minutes to propagate. |
+| Answer arrives all at once, not streaming | CloudFront `compress` must be `false` on the `/api/*` behaviour - compression buffers the whole response. |
 | `ValidationException` mentioning `sessionId` | A client-generated session ID was sent. Only send back one Bedrock issued. |
-| Empty or unhelpful answers | Usually the knowledge base, not the UI. Run `npm run check-status` and `./test-bedrock.sh` from the root. |
-| 500 from `/chat` | Check the Lambda logs - every request logs with a `[RAG]` prefix. |
-| Slow responses | Generation latency. Try `cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0`. |
-| `cdk deploy` fails on a missing asset | `web/out` doesn't exist. Run `npm run build:web`. |
+| Empty answer, no error | A modelled stream exception was ignored. `lambda/chat.mjs` checks each union member explicitly - see [ARCHITECTURE.md](../ARCHITECTURE.md#modelled-errors-do-not-throw). |
+| Malformed JSON errors in the console | The NDJSON buffer isn't holding partial lines. |
+| Unhelpful answers | Usually the knowledge base, not the UI. Run `npm run check-status` and `./test-bedrock.sh` from the root. |
 
 Watch the backend:
 
 ```bash
-FN=$(aws cloudformation describe-stack-resources --stack-name S3VectorRAGStack \
-  --query "StackResources[?ResourceType=='AWS::Lambda::Function' && contains(LogicalResourceId,'BedrockApi')].PhysicalResourceId" \
-  --output text)
+FN=$(aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`ChatFunctionName`].OutputValue' --output text)
 aws logs tail "/aws/lambda/$FN" --follow
 ```
 
 ## ⚠️ Before sharing a deployment
 
-The chat endpoint is **unauthenticated and open to the internet**, with `Access-Control-Allow-Origin: '*'`. Anyone who finds the URL can spend your Bedrock budget.
+The chat endpoint is **unauthenticated**. The Function URL itself is locked to CloudFront, but anyone who has the CloudFront URL can spend your Bedrock budget.
 
-Before giving anyone the link, add an authorizer, restrict CORS to your CloudFront domain, add rate limiting, and set an AWS Budget alert. See [docs/05-testing.md](../docs/05-testing.md#taking-this-to-production).
+Before giving anyone the link, add an authorizer (a CloudFront Function checking a token, Cognito, or Lambda@Edge), add WAF rate limiting, and set an AWS Budget alert. See [docs/05-testing.md](../docs/05-testing.md#taking-this-to-production).
 
 ## Deploying elsewhere
 
-This UI is a plain static export, so it will host anywhere - Vercel, Amplify, Cloudflare Pages, any bucket. The only requirement is that a `config.json` containing `{"apiEndpoint": "..."}` is served from the site root.
+This UI is a plain static export, so the files will host anywhere. But the same-origin `/api/chat` assumption means the host must also route that path to the streaming Lambda. On a different CDN you'd need an equivalent behaviour, or you'd have to reintroduce an absolute endpoint and CORS.
 
 The CDK stack already handles this end to end, so there's no reason to host it separately unless you want a custom domain.

@@ -51,7 +51,7 @@ The key insight: **the model isn't trained on your data, and isn't fine-tuned. I
 | Vector store | Stores vectors, does similarity search | **Amazon S3 Vectors** |
 | Retriever | Finds the top-k relevant chunks | Bedrock Knowledge Base |
 | Generator | Writes the answer | Claude, via a Bedrock inference profile |
-| Orchestrator | Wires the above together | `RetrieveAndGenerate` (one API call) |
+| Orchestrator | Wires the above together | `RetrieveAndGenerateStream` (one streaming API call) |
 
 ## What is Amazon Bedrock?
 
@@ -172,7 +172,7 @@ Light usage (a few hundred queries while working through the tutorial):
 | S3 Vectors storage + requests | Pennies |
 | Titan embeddings (ingestion) | Pennies - a one-off for ~17 documents |
 | Claude generation | The dominant cost; varies by model and query count |
-| Lambda, API Gateway, CloudFront | Free tier |
+| Lambda, CloudFront | Free tier |
 
 **Total: roughly $1-5.** Using `us.anthropic.claude-haiku-4-5-20251001-v1:0` instead of Opus 5 cuts the dominant line item substantially.
 

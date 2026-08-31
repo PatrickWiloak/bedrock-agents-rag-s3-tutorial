@@ -1,38 +1,47 @@
 # Step 7: The Web Interface
 
-A Next.js chat UI, exported as static files, served from S3 through CloudFront, talking to a Lambda over API Gateway.
+A Next.js chat UI, exported as static files, served from S3 through CloudFront - with the streaming chat API on the *same* CloudFront distribution.
 
 ## What you'll build
 
-- A chat interface with markdown rendering, dark mode, and citation display
-- Served globally over HTTPS from CloudFront
-- Backed by the same `RetrieveAndGenerate` call the CLI scripts use
+- A chat interface where answers appear token by token as the model writes them
+- Citations resolved to readable document titles with expandable excerpts
+- Served globally over HTTPS, with both origins private behind Origin Access Control
+- Deployed by the same `cdk deploy` as everything else
 
-The UI is deployed by the same `cdk deploy` as everything else - there is no separate hosting step.
+## The architecture decision that shapes everything
 
-## Architecture
-
-The important structural decision: **the UI is a fully static export with no server side.**
+One CloudFront distribution, two behaviours:
 
 ```
-  cdk deploy
-      │
-      ├── uploads web/out/ ──────────────► S3 website bucket
-      │                                          ▲
-      └── writes config.json ───────────────────┘
-          { "apiEndpoint": "https://xxx.execute-api..." }
-
   Browser
-      │ 1. GET / from CloudFront ──────────► S3 (via Origin Access Control)
-      │ 2. GET /config.json ───────────────► S3
-      │ 3. POST {apiEndpoint}/chat ────────► API Gateway ──► Lambda ──► Bedrock
+      │ GET /                ──► default behaviour ──► S3 (static export, OAC)
+      │ POST /api/chat       ──► /api/* behaviour   ──► Lambda Function URL (OAC)
+      └─◄ NDJSON stream                                     └──► Bedrock
 ```
 
-Three consequences follow from that, and they explain most of the code:
+Because the API is same-origin, three things that a CloudFront + API Gateway design needs simply do not exist here:
 
-1. **There are no Next.js route handlers.** `output: 'export'` in [web/next.config.ts](../web/next.config.ts) forbids them. The browser calls API Gateway directly.
-2. **The API URL can't be baked in at build time** - it doesn't exist until the stack deploys. Hence `config.json`, written during deployment and fetched by the browser at runtime.
-3. **No secrets can live in the front end.** Everything sensitive is in the Lambda's IAM role.
+1. **No endpoint discovery.** The browser POSTs to a relative `/api/chat`. There is no API URL to inject at deploy time and no `config.json` to fetch on page load.
+2. **No CORS.** No preflight, no `Access-Control-Allow-*` headers, and no risk of an error response being discarded by the browser for lacking them.
+3. **No URL joining.** Concatenating a stage URL ending in `/` with `/chat` gives `//chat`, which fails looking like a permissions problem. That bug is structurally impossible now.
+
+And the reason it had to change at all: **API Gateway cannot stream.** Its Lambda proxy integration buffers the entire response before returning it, so the client sees nothing until generation finishes. A Lambda Function URL with `invokeMode: RESPONSE_STREAM` does not buffer.
+
+### The setting that silently breaks it
+
+```ts
+'/api/*': {
+  origin: origins.FunctionUrlOrigin.withOriginAccessControl(chatFunctionUrl),
+  compress: false,   // compression buffers the response and breaks streaming
+  cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+  originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+}
+```
+
+Leave `compress` on and everything still *works* - it just stops streaming. No error, no warning; the whole answer simply arrives at once. It is the kind of failure you can stare at for an hour.
+
+`ALL_VIEWER_EXCEPT_HOST_HEADER` matters too: the Host header must stay the Lambda's own hostname for the OAC signature to validate.
 
 ## Project structure
 
@@ -40,31 +49,164 @@ Three consequences follow from that, and they explain most of the code:
 web/
 ├── next.config.ts        # output: 'export', images unoptimized
 ├── postcss.config.mjs    # Tailwind + autoprefixer
-├── tailwind.config.ts
 ├── app/
-│   ├── layout.tsx        # Root layout, fonts, metadata
-│   ├── page.tsx          # The entire chat interface
-│   └── globals.css       # Tailwind directives and theme
+│   ├── layout.tsx        # Root layout
+│   ├── page.tsx          # Chat interface + stream parser
+│   ├── globals.css
+│   ├── lib/types.ts      # Citation, Message, StreamEvent
+│   └── components/
+│       ├── Citations.tsx
+│       ├── QuickStarters.tsx
+│       └── MisconfiguredBanner.tsx
 └── out/                  # Build output - what CDK uploads (gitignored)
 ```
 
-> **Why `next.config.ts` and not `next.config.js`:** the repository's root `.gitignore` once contained a bare `*.js`, which silently excluded `next.config.js` and `postcss.config.js` from the repo - so a fresh clone could not build the UI at all. The `.gitignore` is now scoped to the compiled CDK output directories, and these config files use extensions that aren't swept up by it.
+> **Why `next.config.ts` and not `next.config.js`:** the repository's root `.gitignore` once contained a bare `*.js`, which silently excluded `next.config.js` and `postcss.config.js` from the repo - so a fresh clone could not build the UI at all. The `.gitignore` is now scoped to the compiled CDK output directories, and these config files use extensions it doesn't sweep up.
 
-## Build and deploy
+## Clean URLs without the error-page hack
 
-```bash
-npm run build:web     # produces web/out
-cdk deploy            # uploads web/out and writes config.json
+A Next.js static export writes `/study-guide/index.html`. A request for `/study-guide` has to be mapped onto it. The common shortcut is a CloudFront custom error response turning 404 into `/index.html` with a 200 - but that papers over genuinely missing objects by serving the homepage, which hides broken links and confuses crawlers.
+
+A viewer-request CloudFront Function does it precisely instead:
+
+```js
+function handler(event) {
+  var request = event.request;
+  var uri = request.uri;
+
+  if (uri.indexOf('/api/') === 0) return request;   // never rewrite the API path
+
+  if (uri.endsWith('/')) {
+    request.uri = uri + 'index.html';
+    return request;
+  }
+
+  if (uri.lastIndexOf('.') < uri.lastIndexOf('/')) {  // no extension => HTML route
+    request.uri = uri + '/index.html';
+  }
+
+  return request;
+}
 ```
 
-**Order matters.** `cdk deploy` fails at synthesis if `web/out` doesn't exist, because `BucketDeployment` needs the asset.
+The `/api/` guard is essential - without it, `/api/chat` would be rewritten to `/api/chat/index.html` and never reach the Lambda.
 
-Get the URL:
+## The streaming Lambda
 
-```bash
-aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`WebsiteURL`].OutputValue' --output text
+`awslambda.streamifyResponse` is a global the Node runtime injects when the Function URL is configured for `RESPONSE_STREAM`. HTTP metadata must be attached before any body is written:
+
+```js
+export const handler = awslambda.streamifyResponse(async (event, responseStream) => {
+  const stream = awslambda.HttpResponseStream.from(responseStream, {
+    statusCode: 200,
+    headers: { 'Content-Type': 'application/x-ndjson', 'Cache-Control': 'no-store' },
+  });
+
+  const write = (obj) => stream.write(`${JSON.stringify(obj)}\n`);
+  // ...
+  stream.end();
+});
 ```
+
+### Why the handler is `.mjs` and not TypeScript
+
+The handler is plain ESM on purpose. An earlier version of this tutorial shipped it as `lambda/bedrock-api.ts` while `tsconfig.json` **excluded** `lambda/` - so nothing ever compiled it, the bundler copied raw TypeScript into the deployment asset, and the Node runtime could not load the module. The Lambda could never have worked.
+
+Keeping the handler as directly runnable JavaScript removes that entire class of problem: what you read is what executes.
+
+### Modelled errors do not throw
+
+`RetrieveAndGenerateStream` delivers failures as members of the stream union rather than as exceptions:
+
+```js
+const modelledError =
+  chunk.internalServerException ?? chunk.validationException ??
+  chunk.accessDeniedException   ?? chunk.throttlingException  ?? /* ... */;
+
+if (modelledError) return fail(modelledError.message);
+```
+
+A handler that only wraps the loop in `try/catch` treats one of these as an ordinary iteration, emits no text, and ends with a cheerful `done`. The user sees an empty answer and nothing is logged.
+
+## The wire protocol
+
+NDJSON - one JSON object per line. No library needed on either end, and partial lines are trivially detectable.
+
+| Event | Payload | When |
+|---|---|---|
+| `session` | `{sessionId}` | Once, before any text |
+| `text` | `{delta}` | Repeatedly, as the model generates |
+| `citation` | `{citation: {index, title, source, category, excerpt, uri}}` | As references resolve |
+| `done` | – | Exactly once, on success |
+| `error` | `{message}` | Instead of `done`, on failure |
+
+## Parsing it in the browser
+
+```ts
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+let buffer = '';
+
+for (;;) {
+  const { done, value } = await reader.read();
+  if (done) break;
+
+  buffer += decoder.decode(value, { stream: true });
+  const lines = buffer.split('\n');
+  buffer = lines.pop() ?? '';        // hold the incomplete tail
+
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const event = JSON.parse(line) as StreamEvent;
+    // session | text | citation | done | error
+  }
+}
+```
+
+Two details worth internalising:
+
+**`buffer = lines.pop()`** - network chunks split wherever TCP decides, not on newlines. Dropping this is the classic route to JSON parse errors that only appear under load.
+
+**`{ stream: true }`** on `decode` - a multi-byte UTF-8 character can be split across chunks. Without this flag it decodes to a replacement character.
+
+### Accumulate outside React state
+
+```ts
+let text = '';
+const citations: Citation[] = [];
+// ... in the loop:
+text += event.delta;
+setStreamingText(text);
+```
+
+React batches state updates, so `streamingText` cannot be read back synchronously when the stream ends. The final message is assembled from the local accumulators.
+
+## Session handling
+
+```ts
+const [sessionId, setSessionId] = useState('');
+
+body: JSON.stringify({
+  message: question,
+  ...(sessionId ? { sessionId } : {}),   // omitted on the first request
+}),
+```
+
+`RetrieveAndGenerateStream` issues session IDs and keeps history server-side. A browser-invented ID is rejected with a validation error, so `sessionId` starts empty and is only ever set from a `session` event. An earlier version generated one on mount, which was simply wrong.
+
+## Citations
+
+Resolution happens in the Lambda, not the browser - filename to friendly title, category folder, trimmed excerpt, deduplicated by URI:
+
+```js
+const TITLES = {
+  'remote-work-policy.md': 'Remote Work Policy',
+  'quarterly-report-q4-2024.md': 'Q4 2024 Quarterly Report',
+  // ...
+};
+```
+
+A raw `s3://docs-123456789012-us-east-1-260831/Human-Resources/remote-work-policy.md` tells a reader nothing about whether the answer came from the right place - which is the only reason to display a citation. Add entries to `TITLES` for documents whose filename doesn't derive a good title on its own.
 
 ## Local development
 
@@ -72,160 +214,73 @@ aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
 npm run dev --workspace=web     # http://localhost:3000
 ```
 
-The dev server has no `config.json`, so the UI shows "Application not deployed" when you try to send a message. To develop against a real backend, drop a `config.json` into `web/public/`:
+Layout, styling, and quick starters all work. **Sending a message will not** - `/api/chat` only exists on the CloudFront distribution. `MisconfiguredBanner` detects this and says so, rather than failing silently.
+
+That's the trade same-origin makes: local development of the chat loop needs a deployed stack. The alternative - an injected absolute endpoint - buys easier local dev at the cost of a runtime config fetch, CORS, and a URL-joining bug.
+
+## Customizing
+
+| What | Where |
+|---|---|
+| Theme colours | `web/tailwind.config.ts`, `web/app/globals.css` |
+| Quick-start questions | `web/app/components/QuickStarters.tsx` |
+| Citation display | `web/app/components/Citations.tsx` |
+| Document titles | `TITLES` in `lambda/chat.mjs` (server-side) |
+| Page metadata | `web/app/layout.tsx` |
 
 ```bash
-mkdir -p web/public
-API=$(aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' --output text)
-echo "{\"apiEndpoint\":\"$API\"}" > web/public/config.json
+./scripts/deploy.sh frontend
 ```
 
-The deployed `config.json` is written by CDK and takes precedence in the built output.
-
-## Key components
-
-### Fetching the endpoint
-
-```typescript
-const configResponse = await fetch('/config.json');
-if (configResponse.ok) {
-  const config = await configResponse.json();
-  apiEndpoint = config.apiEndpoint;
-}
-```
-
-### Normalising the URL
-
-API Gateway stage URLs end in a trailing slash. Appending `/chat` naively yields `/prod//chat`, which fails CORS in a way that looks like a permissions problem:
-
-```typescript
-const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
-const response = await fetch(`${cleanEndpoint}/chat`, { /* ... */ });
-```
-
-### Session handling
-
-The single subtlest piece of the UI:
-
-```typescript
-const [sessionId, setSessionId] = useState('');
-
-// Send it only once Bedrock has issued one.
-body: JSON.stringify({
-  message: input,
-  ...(sessionId ? { sessionId } : {}),
-}),
-
-// Remember what came back.
-if (data.sessionId) {
-  setSessionId(data.sessionId);
-}
-```
-
-`RetrieveAndGenerate` issues session IDs and keeps history server-side. A browser-invented ID is rejected with a validation error, so `sessionId` starts empty and is only ever populated from a response. This is also why there's no `useEffect` generating one on mount - an earlier version did exactly that, and it was wrong.
-
-### Citations
-
-The Lambda flattens and deduplicates citations by S3 URI before returning them, so the UI just renders a list.
-
-### The typing effect
-
-```typescript
-for (let i = 0; i <= fullResponse.length; i++) {
-  setCurrentResponse(fullResponse.substring(0, i));
-  await new Promise(resolve => setTimeout(resolve, 10));
-}
-```
-
-This is cosmetic. The full answer has already arrived; the animation just reveals it. Real token streaming needs a different API surface - see [chapter 06](06-advanced.md#streaming-responses).
-
-## Customizing the interface
-
-**Theme colours** - `web/tailwind.config.ts` and `web/app/globals.css`.
-
-**Sample questions** - the welcome-screen suggestions in `web/app/page.tsx`. Match them to your own corpus; the defaults reference the Nobler Works sample data.
-
-**Message styling** - the message bubble markup in `page.tsx`.
-
-**Page title and metadata** - `web/app/layout.tsx`.
-
-After any change:
-
-```bash
-npm run build:web && cdk deploy
-```
-
-`BucketDeployment` invalidates the CloudFront cache (`distributionPaths: ['/*']`) on every deploy, so changes appear without waiting for TTLs.
-
-## How the pieces are wired in CDK
-
-From [lib/web-hosting-construct.ts](../lib/web-hosting-construct.ts):
-
-**Origin Access Control** - the website bucket is private; CloudFront reads it through OAC, the current mechanism (it supersedes Origin Access Identity):
-
-```typescript
-origin: origins.S3BucketOrigin.withOriginAccessControl(this.websiteBucket),
-```
-
-**SPA routing** - 403 and 404 both return `/index.html` with a 200, so client-side routes resolve.
-
-**Single deployment** - the static export and `config.json` go up in one `BucketDeployment` on purpose. Two separate deployments race each other invalidating the same distribution, and `config.json` would sometimes lose - leaving a live UI pointing at nothing.
-
-**CORS** - API Gateway answers the OPTIONS preflight, but the Lambda must return CORS headers on the actual POST too, or the browser discards the response. Both are configured; if you change one, change the other.
+CloudFront is invalidated on every deploy, so changes appear immediately.
 
 ## Debugging
 
 | Symptom | Cause |
 |---|---|
-| "Application not deployed" | `config.json` missing. Re-run `npm run build:web && cdk deploy`. |
-| CORS error in console | Check for `//chat` in the request URL, or a Lambda error response missing CORS headers. |
-| `ValidationException` on `sessionId` | A client-generated session ID was sent. |
-| 500 from `/chat` | Check the Lambda logs - the `[RAG]` prefix carries full error detail. |
-| UI loads but shows stale content | Hard-refresh; CloudFront was invalidated on deploy but the browser may have cached. |
-| `cdk deploy` fails on a missing asset | `web/out` doesn't exist. Run `npm run build:web`. |
-
-Watch the backend live:
+| "The chat API isn't reachable" | Expected under `next dev`. On a deployment, check Lambda logs and CloudFront propagation. |
+| Answer arrives all at once | `compress` is on for `/api/*`. It must be `false`. |
+| `403` from `/api/chat` | The OAC or the `lambda:InvokeFunctionUrl` permission isn't in place; `cdk deploy` again. |
+| `/api/chat` returns HTML | The URL-rewrite function is missing its `/api/` guard. |
+| Empty answer, no error | A modelled stream exception was ignored. |
+| Malformed JSON in console | The NDJSON buffer isn't holding partial lines. |
 
 ```bash
-FN=$(aws cloudformation describe-stack-resources --stack-name S3VectorRAGStack \
-  --query "StackResources[?ResourceType=='AWS::Lambda::Function' && contains(LogicalResourceId,'BedrockApi')].PhysicalResourceId" \
-  --output text)
+FN=$(aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`ChatFunctionName`].OutputValue' --output text)
 aws logs tail "/aws/lambda/$FN" --follow
 ```
 
 ## Before anyone else uses this
 
-The chat endpoint is **open to the internet and unauthenticated**, with `Access-Control-Allow-Origin: '*'`. Anyone who finds the URL can spend your Bedrock budget. Before sharing a deployment:
+The Function URL is locked to CloudFront by OAC, but **the CloudFront URL itself is unauthenticated**. Anyone who has the link can spend your Bedrock budget.
 
-- Add an authorizer (Cognito, Lambda, or IAM)
-- Restrict CORS to your CloudFront domain
-- Add a usage plan or WAF rate limiting
-- Set an AWS Budget alert
-
-See [chapter 05](05-testing.md#taking-this-to-production).
+Before sharing: add an authorizer, add WAF rate limiting, and set an AWS Budget alert. See [chapter 05](05-testing.md#taking-this-to-production).
 
 ## What you've learned
 
-- Static export plus runtime config is how you deploy a UI that doesn't know its backend URL at build time
-- Session IDs come from the server, and the UI must be built around that
-- OAC is the current way to keep an S3 origin private behind CloudFront
-- The typing animation is cosmetic; real streaming is an architectural change
+- Same-origin API routing removes runtime config, CORS, and a whole class of URL bugs
+- Streaming requires a Function URL, not API Gateway - and CloudFront compression off
+- `awslambda.streamifyResponse` and an NDJSON protocol are enough; no framework needed
+- Partial-line buffering and `{ stream: true }` decoding are not optional
+- Session IDs come from the server
+- A handler you can run is better than one that needs a build step nobody wired up
 
 ## Resources
 
+- [Lambda response streaming](https://docs.aws.amazon.com/lambda/latest/dg/configuration-response-streaming.html)
+- [CloudFront Origin Access Control for Lambda Function URLs](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-lambda.html)
+- [CloudFront Functions](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-functions.html)
 - [Next.js static exports](https://nextjs.org/docs/app/guides/static-exports)
-- [CloudFront Origin Access Control](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-restricting-access-to-s3.html)
-- [API Gateway CORS](https://docs.aws.amazon.com/apigateway/latest/developerguide/how-to-cors.html)
 
 ---
 
 ## You've finished the tutorial
 
-You've built a complete RAG system: documents in S3, embeddings in S3 Vectors, retrieval and generation through a Bedrock Knowledge Base, a Lambda API, and a global web UI - all defined in CDK and torn down with one command.
+You've built a complete RAG system: documents in S3, embeddings in S3 Vectors, retrieval and generation through a Bedrock Knowledge Base, a streaming Lambda, and a global web UI - all defined in CDK and torn down with one command.
 
 **Don't forget:**
 
 ```bash
-npm run destroy
+./scripts/deploy.sh destroy
 ```

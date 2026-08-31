@@ -44,7 +44,7 @@ if ! OUTPUTS=$(aws cloudformation describe-stacks \
   --stack-name "$STACK_NAME" --region "$REGION" \
   --query 'Stacks[0].Outputs' --output json 2>&1); then
   fail "Stack '$STACK_NAME' not found in $REGION"
-  info "Deploy it first: ./deploy.sh"
+  info "Deploy it first: ./scripts/deploy.sh full"
   exit 1
 fi
 
@@ -55,7 +55,7 @@ get_output() {
 KB_ID=$(get_output KnowledgeBaseIdOutput)
 DS_ID=$(get_output DataSourceIdOutput)
 MODEL_ID=$(get_output ModelId)
-API_ENDPOINT=$(get_output ApiEndpoint)
+CHAT_ENDPOINT=$(get_output ChatEndpoint)
 
 if [ -z "$KB_ID" ]; then
   fail "KnowledgeBaseIdOutput missing from stack outputs"
@@ -166,5 +166,29 @@ else
 fi
 echo ""
 
-[ -n "$API_ENDPOINT" ] && info "Web API: ${API_ENDPOINT}chat"
+# ---------------------------------------------------------------------------
+# 7. Streaming endpoint
+#
+# Verifies the whole browser-facing path: CloudFront -> Lambda Function URL ->
+# Bedrock, and that the response actually streams as NDJSON rather than arriving
+# as one buffered blob.
+# ---------------------------------------------------------------------------
+if [ -n "$CHAT_ENDPOINT" ]; then
+  echo "▶ Streaming endpoint"
+  info "POST $CHAT_ENDPOINT"
+
+  FIRST_LINES=$(curl -s --max-time 60 -X POST "$CHAT_ENDPOINT" \
+    -H 'Content-Type: application/json' \
+    -d '{"message":"What is the remote work policy?"}' | head -5)
+
+  if echo "$FIRST_LINES" | jq -e 'select(.type)' >/dev/null 2>&1; then
+    pass "Endpoint returned NDJSON events:"
+    echo "$FIRST_LINES" | jq -rc 'select(.type) | .type' 2>/dev/null | sort -u | sed 's/^/    /'
+  else
+    fail "Endpoint did not return NDJSON"
+    echo "$FIRST_LINES" | head -3 | sed 's/^/    /'
+    info "CloudFront can take a few minutes to propagate after a first deploy."
+  fi
+  echo ""
+fi
 echo "✅ All checks passed."

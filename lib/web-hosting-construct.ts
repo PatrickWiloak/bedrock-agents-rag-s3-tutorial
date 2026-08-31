@@ -4,7 +4,6 @@ import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import * as path from 'path';
@@ -38,8 +37,7 @@ export interface WebHostingConstructProps {
   /**
    * Prompt template controlling how answers are written.
    *
-   * This is the RetrieveAndGenerate equivalent of an agent's instructions. It
-   * must contain the `$search_results$` placeholder. Omit it to use Bedrock's
+   * Must contain the `$search_results$` placeholder. Omit to use Bedrock's
    * built-in template.
    */
   promptTemplate?: string;
@@ -65,12 +63,45 @@ function baseModelIdOf(modelId: string): string {
   return modelId.replace(/^(us|eu|apac|global)\./, '');
 }
 
+/**
+ * Viewer-request function that maps clean URLs onto the objects a Next.js
+ * static export actually writes.
+ *
+ * `/study-guide` and `/study-guide/` both need to resolve to
+ * `/study-guide/index.html`. Doing it here is precise; the alternative - a
+ * CloudFront custom error response mapping 404 to /index.html - papers over
+ * genuinely missing objects by returning the homepage with a 200, which hides
+ * broken links and confuses crawlers.
+ */
+const URL_REWRITE_FUNCTION = `
+function handler(event) {
+  var request = event.request;
+  var uri = request.uri;
+
+  // Never rewrite the API path - that origin is the streaming Lambda.
+  if (uri.indexOf('/api/') === 0) return request;
+
+  // "/foo/" -> "/foo/index.html"
+  if (uri.endsWith('/')) {
+    request.uri = uri + 'index.html';
+    return request;
+  }
+
+  // No file extension means an HTML route: "/foo" -> "/foo/index.html"
+  if (uri.lastIndexOf('.') < uri.lastIndexOf('/')) {
+    request.uri = uri + '/index.html';
+  }
+
+  return request;
+}
+`;
+
 export class WebHostingConstruct extends Construct {
   public readonly distributionDomainName: string;
   public readonly distributionUrl: string;
-  public readonly apiEndpoint: string;
   public readonly websiteBucket: s3.Bucket;
   public readonly distribution: cloudfront.Distribution;
+  public readonly chatFunction: lambda.Function;
 
   constructor(scope: Construct, id: string, props: WebHostingConstructProps) {
     super(scope, id);
@@ -82,12 +113,12 @@ export class WebHostingConstruct extends Construct {
     const baseModelArn = `arn:aws:bedrock:*::foundation-model/${baseModelIdOf(props.modelId)}`;
 
     // ========================================
-    // 1. Lambda function backing the chat API
+    // 1. Streaming chat Lambda
     // ========================================
 
-    const ragApiLambda = new lambda.Function(this, 'BedrockApiFunction', {
+    this.chatFunction = new lambda.Function(this, 'ChatFunction', {
       runtime: lambda.Runtime.NODEJS_22_X,
-      handler: 'bedrock-api.handler',
+      handler: 'chat.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambda'), {
         bundling: {
           image: lambda.Runtime.NODEJS_22_X.bundlingImage,
@@ -98,7 +129,9 @@ export class WebHostingConstruct extends Construct {
           ],
         },
       }),
-      timeout: cdk.Duration.seconds(60),
+      // Generation can run for a while on a large model; the Function URL
+      // streams the whole time, so nothing is waiting on a buffered response.
+      timeout: cdk.Duration.minutes(5),
       memorySize: 512,
       environment: {
         KNOWLEDGE_BASE_ID: props.knowledgeBaseId,
@@ -108,8 +141,8 @@ export class WebHostingConstruct extends Construct {
       },
     });
 
-    // Retrieve is scoped to this one knowledge base.
-    ragApiLambda.addToRolePolicy(
+    // Retrieval is scoped to this one knowledge base.
+    this.chatFunction.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
         actions: ['bedrock:Retrieve', 'bedrock:RetrieveAndGenerate'],
@@ -119,52 +152,34 @@ export class WebHostingConstruct extends Construct {
 
     // Generation runs through the inference profile, which in turn invokes the
     // foundation model in one of the Regions the profile spans.
-    ragApiLambda.addToRolePolicy(
+    this.chatFunction.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ['bedrock:InvokeModel'],
+        actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
         resources: [modelArn, baseModelArn],
       })
     );
 
-    // ========================================
-    // 2. API Gateway REST API
-    // ========================================
-
-    const api = new apigateway.RestApi(this, 'BedrockApi', {
-      restApiName: 'Bedrock RAG API',
-      description: 'API Gateway for Bedrock Knowledge Base queries',
-      deployOptions: {
-        stageName: 'prod',
-        throttlingRateLimit: 100,
-        throttlingBurstLimit: 200,
-      },
-      defaultCorsPreflightOptions: {
-        allowOrigins: apigateway.Cors.ALL_ORIGINS,
-        allowMethods: ['POST', 'OPTIONS'],
-        allowHeaders: [
-          'Content-Type',
-          'X-Amz-Date',
-          'Authorization',
-          'X-Api-Key',
-          'X-Amz-Security-Token',
-        ],
-      },
+    /**
+     * RESPONSE_STREAM is what makes token-by-token output possible. API Gateway
+     * cannot do this: its Lambda proxy integration buffers the entire response
+     * before returning it, so the client sees nothing until generation is done.
+     *
+     * AWS_IAM auth means the URL is not publicly callable on its own - only
+     * CloudFront, through the Origin Access Control below, can sign requests to it.
+     */
+    const chatFunctionUrl = this.chatFunction.addFunctionUrl({
+      authType: lambda.FunctionUrlAuthType.AWS_IAM,
+      invokeMode: lambda.InvokeMode.RESPONSE_STREAM,
     });
 
-    const chat = api.root.addResource('chat');
-    chat.addMethod('POST', new apigateway.LambdaIntegration(ragApiLambda, { proxy: true }));
-
-    this.apiEndpoint = api.url;
-
     // ========================================
-    // 3. S3 bucket for the static site
+    // 2. S3 bucket for the static site
     // ========================================
 
     this.websiteBucket = new s3.Bucket(this, 'WebsiteBucket', {
       // No websiteIndexDocument here - that would create an S3 website endpoint,
-      // which cannot be locked down to CloudFront. Routing is handled by the
-      // CloudFront error responses below instead.
+      // which cannot be locked down to CloudFront.
       publicReadAccess: false,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
@@ -174,35 +189,50 @@ export class WebHostingConstruct extends Construct {
     });
 
     // ========================================
-    // 4. CloudFront distribution
+    // 3. CloudFront: static site + /api/* on one origin
     // ========================================
+
+    const urlRewrite = new cloudfront.Function(this, 'UrlRewriteFunction', {
+      code: cloudfront.FunctionCode.fromInline(URL_REWRITE_FUNCTION),
+      runtime: cloudfront.FunctionRuntime.JS_2_0,
+      comment: 'Rewrites clean URLs to the Next.js static export object keys',
+    });
 
     this.distribution = new cloudfront.Distribution(this, 'WebsiteDistribution', {
       defaultRootObject: 'index.html',
       defaultBehavior: {
-        // Origin Access Control - the current mechanism for private S3 origins.
-        // It supersedes Origin Access Identity and needs no extra construct;
-        // CDK writes the matching bucket policy for us.
         origin: origins.S3BucketOrigin.withOriginAccessControl(this.websiteBucket),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
         compress: true,
+        functionAssociations: [
+          {
+            function: urlRewrite,
+            eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+          },
+        ],
       },
-      errorResponses: [
-        {
-          httpStatus: 404,
-          responseHttpStatus: 200,
-          responsePagePath: '/index.html', // SPA routing
-          ttl: cdk.Duration.minutes(5),
+      additionalBehaviors: {
+        /**
+         * Serving the API from the same distribution as the site is what makes
+         * the front end simple: the browser POSTs to a relative `/api/chat`,
+         * so there is no API URL to discover at runtime and no cross-origin
+         * request to configure. It also removes the trailing-slash class of bug
+         * that comes from string-joining a stage URL.
+         */
+        '/api/*': {
+          origin: origins.FunctionUrlOrigin.withOriginAccessControl(chatFunctionUrl),
+          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+          allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+          // Critical: compression buffers the response and breaks streaming.
+          compress: false,
+          cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+          // Forwards everything except Host, which must stay the Lambda's own
+          // hostname for the signature to validate.
+          originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
         },
-        {
-          httpStatus: 403,
-          responseHttpStatus: 200,
-          responsePagePath: '/index.html', // SPA routing
-          ttl: cdk.Duration.minutes(5),
-        },
-      ],
+      },
       priceClass: cloudfront.PriceClass.PRICE_CLASS_100, // US, Europe, Canada
     });
 
@@ -210,31 +240,18 @@ export class WebHostingConstruct extends Construct {
     this.distributionUrl = `https://${this.distributionDomainName}`;
 
     // ========================================
-    // 5. Deploy the static files
+    // 4. Deploy the static files
     // ========================================
 
-    /**
-     * The site and its config.json go up in a single BucketDeployment on
-     * purpose. Two separate deployments race each other invalidating the same
-     * distribution, and the config would sometimes lose - leaving the UI live
-     * but pointing at nothing.
-     *
-     * config.json carries the API Gateway URL, which only exists at deploy time.
-     */
     new s3deploy.BucketDeployment(this, 'DeployWebsite', {
-      sources: [
-        s3deploy.Source.asset(webBuildPath),
-        s3deploy.Source.jsonData('config.json', {
-          apiEndpoint: this.apiEndpoint,
-        }),
-      ],
+      sources: [s3deploy.Source.asset(webBuildPath)],
       destinationBucket: this.websiteBucket,
       distribution: this.distribution,
       distributionPaths: ['/*'],
     });
 
     // ========================================
-    // 6. Outputs
+    // 5. Outputs
     // ========================================
 
     new cdk.CfnOutput(this, 'WebsiteURL', {
@@ -243,10 +260,15 @@ export class WebHostingConstruct extends Construct {
       exportName: `${stack.stackName}-WebsiteURL`,
     });
 
-    new cdk.CfnOutput(this, 'ApiEndpoint', {
-      value: this.apiEndpoint,
-      description: 'API Gateway endpoint for knowledge base queries',
-      exportName: `${stack.stackName}-ApiEndpoint`,
+    new cdk.CfnOutput(this, 'ChatEndpoint', {
+      value: `${this.distributionUrl}/api/chat`,
+      description: 'Streaming chat endpoint (same origin as the site)',
+      exportName: `${stack.stackName}-ChatEndpoint`,
+    });
+
+    new cdk.CfnOutput(this, 'ChatFunctionName', {
+      value: this.chatFunction.functionName,
+      description: 'Name of the streaming chat Lambda (for log tailing)',
     });
 
     new cdk.CfnOutput(this, 'WebsiteBucketName', {

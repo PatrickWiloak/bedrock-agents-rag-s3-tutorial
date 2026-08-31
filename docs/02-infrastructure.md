@@ -12,8 +12,9 @@ Walk through the CDK stack resource by resource, then deploy it.
 | Knowledge base role | `AWS::IAM::Role` | What Bedrock assumes to do the work |
 | Knowledge base | `AWS::Bedrock::KnowledgeBase` | Ties the index and embedding model together |
 | Data source | `AWS::Bedrock::DataSource` | Points the KB at the document bucket |
-| Chat handler | `AWS::Lambda::Function` | Calls `RetrieveAndGenerate` |
-| Chat API | `AWS::ApiGateway::RestApi` | `POST /chat` |
+| Chat handler | `AWS::Lambda::Function` | Calls `RetrieveAndGenerateStream` |
+| Streaming endpoint | `AWS::Lambda::Url` | `RESPONSE_STREAM`, `AWS_IAM`, private behind OAC |
+| URL rewriter | `AWS::CloudFront::Function` | Clean URLs for the static export |
 | Website bucket | `AWS::S3::Bucket` | Next.js static export |
 | CDN | `AWS::CloudFront::Distribution` | Serves the UI over HTTPS |
 
@@ -26,8 +27,8 @@ bin/s3-rag-app.ts                 # CDK app entry point
 lib/
   s3-rag-stack.ts                 # The stack: buckets, KB, web hosting, outputs
   knowledge-base-construct.ts     # S3 Vectors + Knowledge Base + data source
-  web-hosting-construct.ts        # Lambda + API Gateway + CloudFront + S3
-lambda/bedrock-api.ts             # RetrieveAndGenerate handler
+  web-hosting-construct.ts        # Streaming Lambda + CloudFront + S3
+lambda/chat.mjs                   # RetrieveAndGenerateStream handler
 ```
 
 Three constructs, roughly 350 lines total.
@@ -151,7 +152,20 @@ this.dataSource = new bedrock.CfnDataSource(this, 'DataSource', {
 
 ### Web hosting construct (`lib/web-hosting-construct.ts`)
 
-A Lambda calling `RetrieveAndGenerate`, an API Gateway REST API in front of it, and a CloudFront distribution serving the Next.js export from a private S3 bucket via **Origin Access Control**.
+A streaming Lambda, and one CloudFront distribution with two behaviours - the static export by default, and `/api/*` routed to the Lambda's Function URL. Both origins are private, behind Origin Access Control.
+
+Serving the API from the same distribution as the site is what removes runtime config, CORS, and URL-joining bugs from the front end. One setting is load-bearing and silent when wrong:
+
+```ts
+'/api/*': {
+  origin: origins.FunctionUrlOrigin.withOriginAccessControl(chatFunctionUrl),
+  compress: false,   // compression buffers the response and breaks streaming
+  cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+  originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+}
+```
+
+API Gateway is absent on purpose: its Lambda proxy integration buffers the whole response, which makes streaming impossible.
 
 The Lambda's environment carries the knowledge base ID, the model ARN, retrieval depth, and the prompt template - so tuning any of those is a `cdk deploy`, not a code change.
 
@@ -231,7 +245,7 @@ Worth doing once - `cdk synth` shows exactly what CDK generates from those 350 l
 ### Step 6: Deploy
 
 ```bash
-cdk deploy
+./scripts/deploy.sh infra     # or: npx cdk deploy
 ```
 
 Expect 5-8 minutes. Docker must be running; CDK bundles the Lambda in a `public.ecr.aws/sam/build-nodejs22.x` container.
@@ -243,7 +257,9 @@ aws cloudformation describe-stacks --stack-name S3VectorRAGStack \
   --query 'Stacks[0].Outputs' --output table
 ```
 
-Key outputs: `DataBucketName`, `KnowledgeBaseIdOutput`, `DataSourceIdOutput`, `ModelId`, `WebsiteURL`, `ApiEndpoint`.
+Key outputs: `DataBucketName`, `KnowledgeBaseIdOutput`, `DataSourceIdOutput`, `ModelId`, `WebsiteURL`, `ChatEndpoint`, `ChatFunctionName`.
+
+Or just `./scripts/deploy.sh status`.
 
 ## Understanding IAM roles
 
@@ -312,7 +328,8 @@ Or run the whole check at once:
 | `metadata must have at most 2048 bytes` during ingestion | The index is missing `nonFilterableMetadataKeys`. |
 | `Cannot find asset ... web/out` | Run `npm run build:web` first. |
 | Bundling fails / cannot pull image | Docker isn't running. |
-| `Bucket already exists` | Deploy with a fresh ID: `cdk deploy --context deploymentId=$(date -u +%y%m%d-%H%M)` |
+| `Bucket already exists` | Deploy with a fresh ID: `npx cdk deploy --context deploymentId=$(date -u +%y%m%d-%H%M)` |
+| Answer arrives all at once, not streaming | `compress` must be `false` on the `/api/*` behaviour. |
 | `Rate exceeded` | Bedrock throttling. Wait and retry. |
 | `Stack already exists` in `ROLLBACK_COMPLETE` | `cdk destroy` then redeploy - CloudFormation can't update from that state. |
 | Insufficient permissions | Attach [iam-policy.json](../iam-policy.json). |
@@ -323,13 +340,13 @@ What accrues while the stack is up:
 
 - **S3 storage** - fractions of a cent for the sample documents
 - **S3 Vectors** - per GB stored and per request; no provisioned capacity, so idle cost is essentially nil
-- **CloudFront + API Gateway + Lambda** - free tier covers tutorial usage
+- **CloudFront + Lambda** - free tier covers tutorial usage
 - **Bedrock** - only when you ingest or query
 
 The important difference from an OpenSearch Serverless backend: **there is no always-on capacity charge.** An idle stack costs close to nothing. Delete it anyway when you're done:
 
 ```bash
-npm run destroy
+./scripts/deploy.sh destroy
 ```
 
 ## What we created

@@ -7,8 +7,7 @@
     "build": "next build",
     "export": "next build",
     "start": "next start",
-    "lint": "eslint",
-    "setup": "bash scripts/setup-local-config.sh"
+    "lint": "eslint"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-agent-runtime": "^3.1121.0",

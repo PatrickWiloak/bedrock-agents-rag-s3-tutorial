@@ -10,48 +10,62 @@ This document traces what actually happens when a document is ingested and when 
                           └────────┬─────────┘
                                    │ HTTPS
                                    ▼
-                    ┌──────────────────────────────┐
-                    │  CloudFront Distribution     │
-                    │  (Origin Access Control)     │
-                    └──────┬────────────────┬──────┘
-                           │                │
-              static files │                │ (browser calls the API
-                           ▼                │  directly, not through
-              ┌────────────────────┐        │  CloudFront)
-              │  S3 website bucket │        │
-              │  Next.js export    │        │
-              │  + config.json     │        │
-              └────────────────────┘        │
-                                            ▼
-                              ┌──────────────────────────┐
-                              │  API Gateway  POST /chat │
-                              └────────────┬─────────────┘
-                                           ▼
-                              ┌──────────────────────────┐
-                              │  Lambda: bedrock-api     │
-                              │  RetrieveAndGenerate     │
-                              └────────────┬─────────────┘
-                                           ▼
+        ┌──────────────────────────────────────────────────────┐
+        │  CloudFront - ONE distribution, two behaviours        │
+        │                                                      │
+        │  viewer-request Function rewrites clean URLs         │
+        │  ("/foo" -> "/foo/index.html"), skipping /api/*      │
+        └───────┬──────────────────────────────┬───────────────┘
+       default  │                              │  /api/*
+                ▼                              ▼
+   ┌────────────────────────┐   ┌──────────────────────────────┐
+   │  S3 website bucket     │   │  Lambda Function URL         │
+   │  Next.js static export │   │  AuthType: AWS_IAM           │
+   │  private, S3 OAC       │   │  InvokeMode: RESPONSE_STREAM │
+   └────────────────────────┘   │  private, Lambda OAC         │
+                                │  compress=false, no caching  │
+                                └──────────────┬───────────────┘
+                                               ▼
    ┌───────────────────────────────────────────────────────────────────┐
    │                    Bedrock Knowledge Base                         │
+   │                    (RetrieveAndGenerateStream)                    │
    │                                                                   │
    │   1. embed question    ──►  amazon.titan-embed-text-v2:0          │
    │   2. similarity search ──►  S3 Vectors index (cosine, 1024-dim)   │
    │   3. build prompt      ──►  top-k chunks + PROMPT_TEMPLATE        │
    │   4. generate          ──►  Claude via inference profile          │
-   │                             → answer + citations                  │
+   │                             → text deltas + citation events       │
    └───────────────────────────────────────────────────────────────────┘
-                                           ▲
-                                           │ ingestion
-   ┌───────────────────────────────────────┴───────────────────────────┐
+                                               ▲
+                                               │ ingestion
+   ┌───────────────────────────────────────────┴───────────────────────┐
    │  S3 document bucket                                               │
    │  Financial-Data/ · Human-Resources/ · Meeting-Notes/              │
    └───────────────────────────────────────────────────────────────────┘
 ```
 
+**Both origins are private.** The S3 bucket blocks all public access and is reachable only through an S3-type Origin Access Control; the Function URL is `AWS_IAM` and reachable only through a Lambda-type OAC, with CloudFront signing each request. Neither has a publicly callable URL of its own.
+
+## Why one distribution instead of CloudFront + API Gateway
+
+Serving the API from the same distribution as the site is the decision that most shapes this codebase:
+
+- **Nothing to discover at runtime.** The browser POSTs to a relative `/api/chat`. There is no API URL to inject at deploy time, so no `config.json` fetch on page load.
+- **No CORS.** Same origin means no preflight, no `Access-Control-Allow-*` headers, and no chance of a Lambda error response being discarded by the browser for lacking them.
+- **No URL joining.** Concatenating a stage URL that ends in `/` with `/chat` yields `//chat`, which fails in a way that looks like a permissions problem. That bug cannot exist here.
+- **Streaming is possible at all.** API Gateway's Lambda proxy integration buffers the entire response before returning it. A Function URL with `RESPONSE_STREAM` does not.
+
+The cost is one non-obvious setting, called out in [lib/web-hosting-construct.ts](lib/web-hosting-construct.ts):
+
+```ts
+compress: false,  // compression buffers the response and breaks streaming
+```
+
+Leave compression on and everything still *works* - it just stops streaming, silently, and you get the whole answer at once with no error anywhere.
+
 ## Ingestion flow
 
-Ingestion runs when you call `StartIngestionJob` (which `npm run upload-docs` does for you). It is **not** automatic on upload.
+Ingestion runs when you call `StartIngestionJob` (which `npm run upload-docs` and `./scripts/deploy.sh docs` do for you). It is **not** automatic on upload.
 
 1. **Upload** - documents land in the S3 document bucket under a category folder.
 2. **Scan** - the data source enumerates objects under its `inclusionPrefixes` (this stack indexes the whole bucket).
@@ -67,42 +81,73 @@ Track it with `npm run check-status`.
 ## Query flow
 
 ```
-browser                Lambda                    Bedrock KB
-   │                     │                            │
-   │ POST /chat          │                            │
-   │ {message,           │                            │
-   │  sessionId?}        │                            │
-   ├────────────────────►│                            │
-   │                     │ RetrieveAndGenerate        │
-   │                     ├───────────────────────────►│
-   │                     │                            │ embed question
-   │                     │                            │ search index
-   │                     │                            │ prompt + generate
-   │                     │  {output.text,             │
-   │                     │   citations[],             │
-   │                     │   sessionId}               │
-   │                     │◄───────────────────────────┤
-   │ {response,          │                            │
-   │  citations[],       │                            │
-   │  sessionId}         │                            │
-   │◄────────────────────┤                            │
+browser              Lambda (streaming)          Bedrock KB
+   │                        │                         │
+   │ POST /api/chat         │                         │
+   │ {message, sessionId?}  │                         │
+   ├───────────────────────►│                         │
+   │                        │ RetrieveAndGenerateStream
+   │                        ├────────────────────────►│
+   │ {"type":"session",...} │◄──── sessionId ─────────┤
+   │◄───────────────────────┤                         │
+   │                        │                         │ embed + search
+   │ {"type":"text",...}    │◄──── output event ──────┤
+   │◄───────────────────────┤                         │
+   │ {"type":"citation",...}│◄──── citation event ────┤
+   │◄───────────────────────┤                         │
+   │ {"type":"text",...}    │◄──── output event ──────┤
+   │◄───────────────────────┤          ...            │
+   │ {"type":"done"}        │                         │
+   │◄───────────────────────┤                         │
 ```
 
-One API call does the whole loop. The Lambda's job is only to translate between HTTP and the Bedrock SDK, flatten citations, and add CORS headers.
+### The wire protocol
+
+The Lambda emits **NDJSON** - one JSON object per line. Newline framing is the whole trick: it needs no library on either end, and a partially received line is trivially detectable.
+
+| Event | Payload | When |
+|---|---|---|
+| `session` | `{sessionId}` | Once, before any text |
+| `text` | `{delta}` | Repeatedly, as the model generates |
+| `citation` | `{citation: {index, title, source, category, excerpt, uri}}` | As references are resolved |
+| `done` | – | Exactly once, on success |
+| `error` | `{message}` | Instead of `done`, on failure |
+
+Because chunk boundaries fall wherever the network puts them rather than on newlines, the browser holds the trailing partial line in a buffer until the rest arrives:
+
+```ts
+buffer += decoder.decode(value, { stream: true });
+const lines = buffer.split('\n');
+buffer = lines.pop() ?? '';        // keep the incomplete tail
+```
+
+Dropping that one line is the classic way to end up with intermittently mangled JSON under load.
+
+### Modelled errors do not throw
+
+`RetrieveAndGenerateStream` delivers failures as *members of the stream union*, not as thrown exceptions:
+
+```js
+const modelledError =
+  chunk.internalServerException ?? chunk.validationException ??
+  chunk.accessDeniedException   ?? chunk.throttlingException  ?? ...;
+```
+
+A handler that only wraps the loop in `try/catch` will see one of these as an ordinary iteration, emit no text, and finish with a cheerful `done`. The user gets an empty answer and nothing is logged.
 
 ### Sessions
 
-`RetrieveAndGenerate` keeps conversation history server-side and **issues its own session IDs**. This has one consequence worth internalising:
+`RetrieveAndGenerate` keeps conversation history server-side and **issues its own session IDs**:
 
 - The **first** request of a conversation must omit `sessionId` entirely.
-- The response carries a `sessionId`; send that back on subsequent requests to continue the conversation.
+- The `session` event carries the ID Bedrock assigned; send it back on later requests.
 - A client-invented session ID is rejected with a validation error.
 
-Both [lambda/bedrock-api.ts](lambda/bedrock-api.ts) and [web/app/page.tsx](web/app/page.tsx) implement this - the browser's `sessionId` state starts empty and is only ever populated from a response.
+Both [lambda/chat.mjs](lambda/chat.mjs) and [web/app/page.tsx](web/app/page.tsx) implement this - the browser's `sessionId` state starts empty and is only ever populated from a `session` event.
 
 ### Citations
 
-The response groups references by the span of generated text they support, so the same document commonly appears several times. The Lambda flattens them into a deduplicated list of S3 URIs for the UI.
+The Lambda resolves each S3 key into something readable before sending it - a friendly title, the category folder, and a trimmed excerpt - and deduplicates by URI. A raw `s3://docs-123456789012-us-east-1-260831/Human-Resources/remote-work-policy.md` tells the reader nothing about whether the answer came from the right place, which is the entire point of showing a citation.
 
 ## IAM, and why inference profiles complicate it
 
@@ -117,7 +162,7 @@ Its trust policy is scoped with `aws:SourceAccount`. It deliberately does **not*
 
 **The Lambda role** needs:
 - `bedrock:Retrieve` and `bedrock:RetrieveAndGenerate` on the knowledge base ARN
-- `bedrock:InvokeModel` on **both** the inference profile ARN **and** the underlying foundation model ARN
+- `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on **both** the inference profile ARN **and** the underlying foundation model ARN
 
 That last point catches people out. An inference profile like `us.anthropic.claude-opus-5` routes requests to the same model in one of several Regions, and authorization is evaluated against the foundation model in whichever Region serves the request. So the policy needs both:
 
@@ -139,13 +184,15 @@ Everything below is native CloudFormation. There are no custom resources except 
 | Vector index | `AWS::S3Vectors::Index` |
 | Knowledge base | `AWS::Bedrock::KnowledgeBase` (`S3VectorsConfiguration`) |
 | Data source | `AWS::Bedrock::DataSource` |
-| Chat API handler | `AWS::Lambda::Function` |
-| Chat API | `AWS::ApiGateway::RestApi` |
+| Chat handler | `AWS::Lambda::Function` |
+| Streaming endpoint | `AWS::Lambda::Url` (`InvokeMode: RESPONSE_STREAM`) |
 | Website bucket | `AWS::S3::Bucket` |
-| CDN | `AWS::CloudFront::Distribution` + `OriginAccessControl` |
+| URL rewriter | `AWS::CloudFront::Function` |
+| CDN | `AWS::CloudFront::Distribution` + two `OriginAccessControl`s |
 
 ## Learn More
 
 - [docs/01-understanding.md](docs/01-understanding.md) - RAG concepts from scratch
 - [docs/02-infrastructure.md](docs/02-infrastructure.md) - the CDK stack line by line
 - [docs/03-querying.md](docs/03-querying.md) - the query API in depth
+- [docs/07-web-interface.md](docs/07-web-interface.md) - the UI and the streaming path

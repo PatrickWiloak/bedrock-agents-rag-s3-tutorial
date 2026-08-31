@@ -10,7 +10,7 @@ That framing drives most decisions here. The audience is people who have never u
 
 ## Architecture in one paragraph
 
-Documents in S3 → Bedrock Knowledge Base ingests, chunks (300 tokens, 7% overlap), and embeds them with Titan Text Embeddings V2 → vectors land in an S3 Vectors index → questions go through `RetrieveAndGenerate`, which retrieves and generates in one call → answers come back with citations. A Lambda behind API Gateway exposes that to a static Next.js UI served from CloudFront. Three CDK constructs, ~350 lines. See [ARCHITECTURE.md](ARCHITECTURE.md).
+Documents in S3 → Bedrock Knowledge Base ingests, chunks (300 tokens, 7% overlap), and embeds them with Titan Text Embeddings V2 → vectors land in an S3 Vectors index → questions go through `RetrieveAndGenerateStream` → answers stream back with citations. A streaming Lambda Function URL sits behind CloudFront at `/api/*`, on the same distribution that serves the static Next.js UI. Three CDK constructs, ~400 lines. See [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Facts that are easy to get wrong
 
@@ -33,34 +33,45 @@ These caused real bugs. Verify before changing anything nearby.
 
 6. **The root `.gitignore` must not contain a bare `*.js`.** It previously did, which silently excluded `web/next.config.js` and `web/postcss.config.js` and made the web UI unbuildable from a fresh clone. The rules are now scoped to `/bin`, `/lib`, `/lambda`, `/scripts`.
 
-7. **`npm run build:web` must run before `cdk deploy`.** The stack uploads `web/out`; synthesis fails if it doesn't exist.
+7. **`npm run build:web` must run before `cdk deploy`.** The stack uploads `web/out`; synthesis fails if it doesn't exist. `./scripts/deploy.sh` does it for you.
+
+8. **CloudFront `compress` must stay `false` on the `/api/*` behaviour.** Compression buffers the response and silently stops streaming - no error, the answer just arrives all at once.
+
+9. **The Lambda handler is `lambda/chat.mjs`, deliberately plain JavaScript.** It was previously `bedrock-api.ts` while `tsconfig.json` excluded `lambda/`, so nothing compiled it and the runtime could not load it. Do not reintroduce a TypeScript handler without also wiring up a build step.
+
+10. **`RetrieveAndGenerateStream` reports failures as members of the stream union**, not as thrown exceptions. Check `chunk.validationException`, `chunk.accessDeniedException`, and friends explicitly, or errors become silent empty answers.
+
+11. **The URL-rewrite CloudFront Function must skip `/api/`.** Without the guard it rewrites `/api/chat` to `/api/chat/index.html` and the Lambda is never reached.
 
 ## Common commands
 
 ```bash
-npm install                  # root + web workspace
-npm run build:web            # Next.js static export → web/out  (before every deploy)
-npm run synth                # render the CloudFormation template
-npm run diff                 # diff against deployed state
-cdk deploy                   # deploy (Docker must be running)
-npm run upload-docs          # upload sample docs + start ingestion
-npm run check-status         # ingestion job progress
-npm run test-rag             # query from the CLI (add `interactive`)
-./test-bedrock.sh            # bottom-up diagnostic - run this first when broken
-npm run destroy              # tear everything down
+npm install                     # root + web workspace
+./scripts/deploy.sh full        # everything: build, deploy, upload, ingest, health check
+./scripts/deploy.sh infra       # cdk deploy only
+./scripts/deploy.sh frontend    # rebuild + redeploy the UI
+./scripts/deploy.sh docs        # re-upload documents and re-ingest
+./scripts/deploy.sh diff        # cdk diff
+./scripts/deploy.sh status      # resource IDs and URLs
+./scripts/deploy.sh destroy     # tear down (typed confirmation)
+
+npm run build:web               # Next.js static export → web/out (before any cdk deploy)
+npm run check-status            # ingestion job progress
+npm run test-rag                # query from the CLI (add `interactive`)
+./test-bedrock.sh               # bottom-up diagnostic - run this first when broken
 ```
 
 Override the model without editing code:
 
 ```bash
-cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0
+MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0 ./scripts/deploy.sh infra
 ```
 
 ## Safety guardrails
 
-- **Never deploy or destroy without being asked.** Deploys cost money and `cdk destroy` deletes the document bucket (`autoDeleteObjects: true`).
+- **Never deploy or destroy without being asked.** Deploys cost money and `./scripts/deploy.sh destroy` deletes the document bucket (`autoDeleteObjects: true`).
 - **`removalPolicy: DESTROY` and `autoDeleteObjects: true` are deliberate tutorial choices.** They make teardown clean. Do not copy them into production advice without flagging the consequence.
-- **The chat API is unauthenticated by design**, with `Access-Control-Allow-Origin: '*'`. This is called out in the docs as a thing to fix before sharing a deployment - don't silently "fix" it in a way that breaks the tutorial's simplicity, and don't remove the warnings.
+- **The chat API is unauthenticated by design.** The Function URL is locked to CloudFront by OAC, but the CloudFront URL is open. This is called out in the docs as a thing to fix before sharing a deployment - don't silently "fix" it in a way that breaks the tutorial's simplicity, and don't remove the warnings.
 - **Verify AWS facts against the live API**, not from memory. Model IDs, lifecycle status, and CloudFormation resource schemas all move:
   ```bash
   aws bedrock list-foundation-models --by-provider anthropic --region us-east-1

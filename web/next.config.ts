@@ -6,9 +6,10 @@ import type { NextConfig } from 'next';
  * which the CDK stack uploads.
  *
  * Consequences worth knowing:
- * - There are no server-side route handlers. Chat requests go straight from the
- *   browser to API Gateway, using the endpoint written into config.json at
- *   deploy time.
+ * - There are no server-side route handlers. The chat API is served from the
+ *   SAME origin - CloudFront routes /api/* to a streaming Lambda Function URL -
+ *   so the browser POSTs to a relative /api/chat with no CORS and nothing to
+ *   look up at runtime.
  * - Image optimization needs a server, so it is disabled.
  */
 const nextConfig: NextConfig = {

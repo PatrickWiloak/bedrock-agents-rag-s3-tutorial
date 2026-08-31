@@ -100,7 +100,7 @@ Latency is dominated by generation. Expect a few seconds per question with Haiku
 
 ### 5. Load testing
 
-API Gateway is configured with `throttlingRateLimit: 100` and `throttlingBurstLimit: 200` in [lib/web-hosting-construct.ts](../lib/web-hosting-construct.ts). Bedrock has its own account-level quotas, which are usually the real ceiling. Raise them via Service Quotas before any load test that matters.
+There is no API Gateway throttle here - the Function URL is reached through CloudFront, and Lambda's own concurrency limit is the first ceiling. Bedrock's account-level quotas are usually the real one. Raise them via Service Quotas before any load test that matters, and add WAF rate limiting on the distribution before exposing it.
 
 ## Validation checklist
 
@@ -113,7 +113,8 @@ Before calling a deployment good:
 - [ ] Out-of-scope questions are refused, not invented
 - [ ] Multi-turn follow-ups resolve correctly (session handling works)
 - [ ] The CloudFront URL loads and can hold a conversation
-- [ ] `cdk destroy` on a scratch deployment leaves nothing behind
+- [ ] Answers stream token by token rather than arriving all at once
+- [ ] `./scripts/deploy.sh destroy` on a scratch deployment leaves nothing behind
 
 ## Monitoring & observability
 
@@ -168,13 +169,13 @@ Both buckets use these so `cdk destroy` is clean. In production, use `RETAIN`, e
 
 ### 2. The API is unauthenticated
 
-`POST /chat` is open to the internet, with `Access-Control-Allow-Origin: '*'`. Anyone who finds the URL can spend your Bedrock budget.
+The Function URL is locked to CloudFront by Origin Access Control, but the CloudFront URL itself is open to the internet. Anyone who finds it can spend your Bedrock budget.
 
 At minimum, add:
 
-- An authorizer - Cognito, Lambda, or IAM
-- A CORS origin restricted to your CloudFront domain
-- A usage plan and API key, or WAF rate limiting per IP
+- An authorizer - a CloudFront Function checking a token, Cognito, or Lambda@Edge
+- WAF rate limiting per IP on the distribution
+- An AWS Budget alert
 
 ### 3. No budget guardrail
 
@@ -222,7 +223,7 @@ Reduction levers, in order of impact:
 2. **Lower `numberOfResults`** - fewer chunks means fewer input tokens per query
 3. **Smaller chunks** - same effect
 4. **Cache repeated questions** - identical questions shouldn't hit Bedrock twice
-5. **Delete idle stacks** - `npm run destroy`
+5. **Delete idle stacks** - `./scripts/deploy.sh destroy`
 
 S3 Vectors bills per request and per GB rather than for provisioned capacity, so an idle stack costs almost nothing. Generation is essentially the whole bill.
 

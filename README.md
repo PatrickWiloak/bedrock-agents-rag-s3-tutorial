@@ -33,7 +33,7 @@ one CDK command, a Next.js UI, and the debugging tools to see what the retriever
 
 </div>
 
-> **Tutorial:** Build a document Q&A system on AWS using Amazon Bedrock Knowledge Bases and S3 Vectors. Deployed with CDK, queried through `RetrieveAndGenerate`, with a Next.js web UI and citations.
+> **Tutorial:** Build a document Q&A system on AWS using Amazon Bedrock Knowledge Bases and S3 Vectors. Deployed with CDK, streamed token-by-token through `RetrieveAndGenerateStream`, with a Next.js web UI and citations.
 
 Learn how to build and deploy a **Retrieval-Augmented Generation (RAG)** system using Amazon Bedrock Knowledge Bases, Amazon S3 Vectors, and AWS CDK.
 
@@ -41,7 +41,7 @@ Learn how to build and deploy a **Retrieval-Augmented Generation (RAG)** system 
 
 ## 📢 What changed in v2 (August 2026)
 
-If you used the original version of this tutorial, three things are materially different. All three are consequences of AWS changes, not stylistic rewrites.
+If you used the original version of this tutorial, four things are materially different.
 
 **1. S3 Vectors is generally available, with native CloudFormation support.**
 The original tutorial was written while S3 Vectors was in preview, and leaned on the community [cdk-s3-vectors](https://github.com/bimnett/cdk-s3-vectors) library plus a manual console-setup guide to work around the missing CloudFormation resources. Those resources now exist - `AWS::S3Vectors::VectorBucket`, `AWS::S3Vectors::Index`, and an `S3VectorsConfiguration` storage type on `AWS::Bedrock::KnowledgeBase`. The stack is now plain `aws-cdk-lib`, and the manual-setup guide is gone.
@@ -55,7 +55,10 @@ Bedrock **Knowledge Bases are explicitly not affected**, so the retrieval half o
 
 If you specifically want an *agent* (tools, multi-step orchestration, action groups), AWS's recommended path is now [Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/what-is-bedrock-agentcore.html), which is outside this tutorial's scope.
 
-**3. Model IDs are inference profiles now.**
+**3. Answers stream, and the API moved onto CloudFront.**
+The chat endpoint is now a Lambda Function URL with `invokeMode: RESPONSE_STREAM`, served at `/api/*` from the same CloudFront distribution as the site. API Gateway is gone: its Lambda proxy integration buffers the whole response, which makes streaming impossible. Because the API is now same-origin, the runtime `config.json` lookup, the CORS configuration, and a trailing-slash URL-joining bug all disappeared with it.
+
+**4. Model IDs are inference profiles now.**
 Every current Claude model on Bedrock is served **exclusively** through a cross-Region inference profile - none of them support `ON_DEMAND` invocation any more. So model IDs look like `us.anthropic.claude-opus-5`, not `anthropic.claude-3-sonnet-20240229-v1:0`. The old default model no longer exists in the Bedrock catalog at all. See [Choosing a model](#choosing-a-model).
 
 ---
@@ -68,8 +71,8 @@ By the end of this tutorial, you'll have a working **RAG system** that:
 - Creates a **Bedrock Knowledge Base** using **S3 Vectors** for vector storage
 - Answers questions with **`RetrieveAndGenerate`**, grounded in your documents
 - Returns **citations** pointing back at the source documents
-- Serves a **Next.js web UI** through CloudFront, with dark mode and markdown rendering
-- Deploys with a **single command** and tears down with `cdk destroy`
+- **Streams answers token by token** to a Next.js web UI served through CloudFront
+- Deploys with a **single command** and tears down with one
 
 ## Why S3 Vectors
 
@@ -90,16 +93,19 @@ The tradeoff is that S3 Vectors is optimised for cost over latency. For a docume
          │ HTTPS
          ↓
 ┌─────────────────────────────────────────────────────────┐
-│  CloudFront CDN                                         │
-│  • Serves the Next.js static export from S3 (via OAC)   │
+│  CloudFront - one distribution, two behaviours          │
+│                                                         │
+│   default  ──► S3 static site (private, via OAC)        │
+│   /api/*   ──► Lambda Function URL (private, via OAC)   │
+│               compress=false, caching disabled          │
 └────────┬────────────────────────────────────────────────┘
-         │
-         │  browser reads /config.json for the API URL,
-         │  then POSTs the question to API Gateway
+         │  the browser POSTs to a relative /api/chat -
+         │  same origin, so no endpoint discovery, no CORS
          ↓
 ┌─────────────────────────────────────────────────────────┐
-│  API Gateway  →  Lambda (bedrock-api)                   │
-│  • One call: bedrock-agent-runtime:RetrieveAndGenerate   │
+│  Streaming Lambda (RESPONSE_STREAM)                     │
+│  • RetrieveAndGenerateStream                            │
+│  • emits NDJSON: session · text · citation · done       │
 └────────┬────────────────────────────────────────────────┘
          │
          ↓
@@ -145,7 +151,7 @@ You need:
 - ✅ AWS CLI configured with credentials
 - ✅ AWS CDK: `npm install -g aws-cdk`
 - ✅ **Docker running** - CDK bundles the Lambda in a container
-- ✅ `jq` - used by `test-bedrock.sh`
+- ✅ `jq` - used by `test-bedrock.sh` and `scripts/deploy.sh`
 - ✅ The [required IAM permissions](#required-iam-permissions)
 
 > **Note**: This project uses npm workspaces. `npm install` at the root installs both the CDK infrastructure and the Next.js web UI.
@@ -189,7 +195,7 @@ The **embedding** model is separate and is `amazon.titan-embed-text-v2:0` (1024 
 
 > **⚠️ Do this BEFORE running the deploy script.** The deploy script cannot grant you permissions - you or your administrator must attach the policy first.
 
-This repository ships a ready-to-use policy in [iam-policy.json](iam-policy.json). It covers the Bedrock and S3 Vectors permissions this tutorial needs, **on top of** the permissions CDK normally uses (CloudFormation, Lambda, API Gateway, CloudFront), which the CDK bootstrap roles usually provide.
+This repository ships a ready-to-use policy in [iam-policy.json](iam-policy.json). It covers the Bedrock and S3 Vectors permissions this tutorial needs, **on top of** the permissions CDK normally uses (CloudFormation, Lambda, CloudFront), which the CDK bootstrap roles usually provide.
 
 ```bash
 # 1. Clone the repository
@@ -220,10 +226,23 @@ If you already have `AdministratorAccess`, you can skip this.
 ```bash
 git clone https://github.com/PatrickWiloak/bedrock-agents-rag-s3-tutorial.git
 cd bedrock-agents-rag-s3-tutorial
-./deploy.sh
+npm install
+./scripts/deploy.sh full
 ```
 
-The script installs dependencies, builds the web UI, bootstraps CDK if needed, deploys the stack, uploads the sample documents, waits for ingestion, and prints the CloudFront URL.
+`full` checks prerequisites, builds the web UI, deploys the stack, uploads the sample documents, waits for ingestion, runs a health check, and prints the CloudFront URL.
+
+The script has subcommands for everything else:
+
+```bash
+./scripts/deploy.sh infra      # cdk deploy only
+./scripts/deploy.sh frontend   # rebuild and redeploy the UI
+./scripts/deploy.sh docs       # re-upload documents and re-ingest
+./scripts/deploy.sh ingest     # re-ingest what is already in S3
+./scripts/deploy.sh diff       # cdk diff
+./scripts/deploy.sh status     # resource IDs and URLs
+./scripts/deploy.sh destroy    # tear down (typed confirmation)
+```
 
 ### Option 2: Step by step (recommended for learning) 🎓
 
@@ -238,7 +257,7 @@ npm run build:web
 cdk bootstrap
 
 # Deploy
-cdk deploy
+npx cdk deploy
 
 # Upload the sample documents and start ingestion
 npm run upload-docs
@@ -303,7 +322,7 @@ Plus `.docx` versions of the dress code, vacation policy, employee handbook, and
 | [04 - Customization](docs/04-customization.md) | Chunking, prompt templates, models, retrieval tuning |
 | [05 - Testing](docs/05-testing.md) | Test scripts, evaluating answer quality, debugging |
 | [06 - Advanced](docs/06-advanced.md) | Metadata filtering, multiple knowledge bases, guardrails, production concerns |
-| [07 - Web Interface](docs/07-web-interface.md) | The Next.js UI, API Gateway, Lambda, CloudFront |
+| [07 - Web Interface](docs/07-web-interface.md) | The Next.js UI, the streaming Lambda, CloudFront |
 
 Also see [docs/S3-VECTORS-SETUP.md](docs/S3-VECTORS-SETUP.md) for S3 Vectors specifics and limits.
 
@@ -316,37 +335,43 @@ bedrock-agents-rag-s3-tutorial/
 ├── QUICKSTART.md                   # 10-minute quick start
 ├── CLAUDE.md                       # Context for AI assistants working here
 ├── TODO.md                         # Open work on this repo
-├── deploy.sh                       # One-command deployment
 ├── test-bedrock.sh                 # Bottom-up deployment diagnostic
 ├── iam-policy.json                 # Permissions needed to deploy
+├── .nvmrc                          # Node version (22)
 ├── docs/                           # Tutorial chapters 01-07
 ├── bin/
 │   └── s3-rag-app.ts               # CDK app entry point
 ├── lib/
 │   ├── s3-rag-stack.ts             # The stack: bucket, KB, web hosting
 │   ├── knowledge-base-construct.ts # S3 Vectors + Knowledge Base + data source
-│   └── web-hosting-construct.ts    # Lambda + API Gateway + CloudFront + S3
+│   └── web-hosting-construct.ts    # Streaming Lambda + CloudFront + S3
 ├── lambda/
-│   └── bedrock-api.ts              # RetrieveAndGenerate handler
+│   └── chat.mjs                    # Streaming RetrieveAndGenerateStream handler
 ├── scripts/
+│   ├── deploy.sh                   # Deployment entry point (subcommands)
 │   ├── upload-documents.ts         # Upload sample docs, start ingestion
 │   ├── test-rag.ts                 # Query from the terminal (demo/interactive)
 │   └── check-status.ts             # Ingestion job status
 ├── sample-data/knowledge-docs/     # The Nobler Works documents
 └── web/                            # Next.js static-export UI
     ├── next.config.ts              # output: 'export'
-    └── app/page.tsx                # Chat interface
+    └── app/
+        ├── page.tsx                # Chat interface (NDJSON stream parser)
+        ├── components/             # QuickStarters, Citations, MisconfiguredBanner
+        └── lib/types.ts            # Shared Citation / StreamEvent types
 ```
 
 ## What You'll Learn
 
-**AWS services** - S3, S3 Vectors, Bedrock Knowledge Bases, Bedrock runtime models, Lambda, API Gateway, CloudFront, IAM.
+**AWS services** - S3, S3 Vectors, Bedrock Knowledge Bases, Bedrock runtime models, Lambda Function URLs, CloudFront (behaviours, Functions, Origin Access Control), IAM.
 
 **CDK** - stacks and constructs, L1 vs L2, resource dependencies, IAM grants, asset bundling, static site deployment.
 
 **RAG** - chunking and overlap, embeddings and dimensions, cosine similarity, top-k retrieval, grounding and citations, prompt templates.
 
-**Bedrock APIs** - `RetrieveAndGenerate`, `Retrieve`, ingestion jobs, inference profiles, and why the distinction between a foundation model and an inference profile matters for IAM.
+**Bedrock APIs** - `RetrieveAndGenerateStream`, `RetrieveAndGenerate`, `Retrieve`, ingestion jobs, inference profiles, and why the distinction between a foundation model and an inference profile matters for IAM.
+
+**Streaming** - Lambda `RESPONSE_STREAM` invoke mode, `awslambda.streamifyResponse`, an NDJSON wire protocol, incremental parsing in the browser, and why CloudFront compression must be off on a streaming behaviour.
 
 ## Customization Points
 
@@ -367,7 +392,7 @@ Running this tutorial costs roughly **$1-5 total**, dominated by model inference
 | S3 Vectors | Pay per request and per GB stored - cents for this dataset |
 | Bedrock embeddings | One-off at ingestion; Titan v2 is very cheap |
 | Bedrock generation | The main cost. Per token, varies a lot by model - Haiku 4.5 is far cheaper than Opus 5 |
-| Lambda / API Gateway | Free tier covers tutorial usage |
+| Lambda | Free tier covers tutorial usage |
 | CloudFront | Free tier covers tutorial usage |
 
 ### Cleanup
@@ -375,10 +400,10 @@ Running this tutorial costs roughly **$1-5 total**, dominated by model inference
 Everything in the stack is native CloudFormation, so teardown is one command:
 
 ```bash
-npm run destroy      # or: cdk destroy
+./scripts/deploy.sh destroy      # or: npm run destroy
 ```
 
-This removes the document bucket, the vector bucket and index, the knowledge base, the data source, the website bucket, CloudFront, API Gateway, and the Lambda.
+This removes the document bucket, the vector bucket and index, the knowledge base, the data source, the website bucket, CloudFront, and the Lambda.
 
 > **The old manual-teardown checklist is no longer needed.** It existed because the preview-era custom resources could not reliably delete themselves. If you deployed the *original* version of this tutorial, that stack still needs the manual steps - see the [v1 README](https://github.com/PatrickWiloak/bedrock-agents-rag-s3-tutorial/blob/e7b0810/README.md#detailed-cleanup-steps-option-a).
 

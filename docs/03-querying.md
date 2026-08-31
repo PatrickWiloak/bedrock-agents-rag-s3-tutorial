@@ -16,7 +16,7 @@ The stack is deployed but the knowledge base is empty. This chapter fills it and
 ### Using the upload script
 
 ```bash
-npm run upload-docs
+npm run upload-docs          # or: ./scripts/deploy.sh docs
 ```
 
 It uploads everything under `sample-data/knowledge-docs/`, preserving the folder structure, then calls `StartIngestionJob`:
@@ -131,6 +131,8 @@ npm run test-rag interactive    # ask your own
 ```
 
 ### The API call
+
+The web UI uses the streaming variant, `RetrieveAndGenerateStream` (see [chapter 07](07-web-interface.md)). The non-streaming form below is what `scripts/test-rag.ts` uses, and it is the clearer one to read first - the configuration is identical.
 
 ```typescript
 const response = await client.send(new RetrieveAndGenerateCommand({

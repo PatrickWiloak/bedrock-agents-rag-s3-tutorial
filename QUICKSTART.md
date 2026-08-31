@@ -9,8 +9,8 @@ For the full explanation of what you're building, start with [README.md](README.
 - **S3 bucket** with 17 sample company documents in three folders
 - **S3 Vectors** vector bucket and index (serverless vector database)
 - **Bedrock Knowledge Base** wired to that index
-- **Lambda + API Gateway** exposing a `/chat` endpoint backed by `RetrieveAndGenerate`
-- **CloudFront + S3** serving a Next.js chat UI
+- **Streaming Lambda** behind a Function URL, backed by `RetrieveAndGenerateStream`
+- **CloudFront + S3** serving a Next.js chat UI, with `/api/*` routed to the Lambda on the same origin
 
 No Bedrock Agent is involved - see [What changed in v2](README.md#-what-changed-in-v2-august-2026).
 
@@ -44,7 +44,7 @@ Note the `us.` prefix: every current Claude model on Bedrock is served through a
 To use a cheaper, faster model for the tutorial:
 
 ```bash
-cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0
+MODEL_ID=us.anthropic.claude-haiku-4-5-20251001-v1:0 ./scripts/deploy.sh infra
 ```
 
 ## Installation & Deployment
@@ -54,10 +54,11 @@ cdk deploy --context modelId=us.anthropic.claude-haiku-4-5-20251001-v1:0
 ```bash
 git clone https://github.com/PatrickWiloak/bedrock-agents-rag-s3-tutorial.git
 cd bedrock-agents-rag-s3-tutorial
-./deploy.sh
+npm install
+./scripts/deploy.sh full
 ```
 
-That does everything below and prints your CloudFront URL at the end.
+That does everything below - prerequisites, build, deploy, upload, ingest, health check - and prints your CloudFront URL at the end.
 
 ### The manual path
 
@@ -69,10 +70,10 @@ npm install
 npm run build:web
 
 # First time in this account/Region only
-cdk bootstrap
+npx cdk bootstrap
 
 # Deploy (5-8 minutes)
-cdk deploy
+npx cdk deploy
 ```
 
 ## Upload Documents
@@ -131,9 +132,9 @@ A complete RAG pipeline:
 3. Vectors stored in an S3 Vectors index with cosine distance
 4. Questions embedded the same way, matched against the index
 5. Top 5 chunks passed to Claude with a prompt template
-6. A grounded answer returned with citations back to the source documents
+6. A grounded answer **streamed back token by token**, with citations resolved to readable document titles
 
-All of it defined in ~350 lines of CDK across three constructs.
+All of it defined in ~400 lines of CDK across three constructs, with no API Gateway and no CORS.
 
 ## Next Steps
 
@@ -144,10 +145,10 @@ All of it defined in ~350 lines of CDK across three constructs.
     --stack-name S3VectorRAGStack \
     --query 'Stacks[0].Outputs[?OutputKey==`DataBucketName`].OutputValue' \
     --output text)/Financial-Data/"
-  npm run upload-docs    # re-runs ingestion
+  ./scripts/deploy.sh docs    # re-uploads and re-ingests
   ```
 
-- **Change how it answers** - edit `PROMPT_TEMPLATE` in [lib/s3-rag-stack.ts](lib/s3-rag-stack.ts), then `cdk deploy`
+- **Change how it answers** - edit `PROMPT_TEMPLATE` in [lib/s3-rag-stack.ts](lib/s3-rag-stack.ts), then `./scripts/deploy.sh infra`
 - **Tune retrieval** - `numberOfResults`, chunk size, overlap; see [docs/04-customization.md](docs/04-customization.md)
 - **Read the tutorial** - [docs/01-understanding.md](docs/01-understanding.md) onward
 
@@ -166,18 +167,19 @@ Run the diagnostic first - it checks each layer in order and stops at the real f
 | "I don't have that information" | Ingestion hasn't finished, or finished with failures. Run `npm run check-status`. |
 | Ingestion fails: `metadata must have at most 2048 bytes` | The index is missing its `nonFilterableMetadataKeys`. See [ARCHITECTURE.md](ARCHITECTURE.md#ingestion-flow). |
 | `cdk deploy` fails bundling the Lambda | Docker isn't running. |
-| Web UI says "Application not deployed" | `config.json` missing from the website bucket - re-run `cdk deploy` after `npm run build:web`. |
-| Stack fails on bucket name already exists | Redeploy with a fresh ID: `cdk deploy --context deploymentId=$(date -u +%y%m%d-%H%M)` |
+| Web UI shows "The chat API isn't reachable" | Expected under `next dev` (there is no CloudFront). On a real deployment, check the Lambda logs and CloudFront propagation. |
+| Stack fails on bucket name already exists | Redeploy with a fresh ID: `npx cdk deploy --context deploymentId=$(date -u +%y%m%d-%H%M)` |
+| Answer arrives all at once instead of streaming | CloudFront `compress` is on for `/api/*`. It must be `false`. |
 
 ## Clean Up
 
 Everything is native CloudFormation, so one command removes all of it:
 
 ```bash
-npm run destroy      # or: cdk destroy
+./scripts/deploy.sh destroy
 ```
 
-Confirm with `y`.
+It asks you to type the stack name to confirm.
 
 ### Cost estimate
 

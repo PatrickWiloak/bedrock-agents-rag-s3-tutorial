@@ -1,184 +1,211 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import type { Citation, Message, StreamEvent } from './lib/types';
+import MisconfiguredBanner from './components/MisconfiguredBanner';
+import QuickStarters from './components/QuickStarters';
+import Citations from './components/Citations';
 
-interface Message {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  citations?: string[];
-  timestamp: Date;
-}
+/**
+ * The chat API is served from the same origin as this page - CloudFront routes
+ * /api/* to a streaming Lambda Function URL. That means no endpoint to discover
+ * at runtime, no CORS, and no cross-origin preflight.
+ */
+const CHAT_ENDPOINT = '/api/chat';
+
+const AssistantAvatar = () => (
+  <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-gray-200">
+    <svg className="h-5 w-5 text-black" fill="currentColor" viewBox="0 0 20 20">
+      <path d="M2 5a2 2 0 012-2h7a2 2 0 012 2v4a2 2 0 01-2 2H9l-3 3v-3H4a2 2 0 01-2-2V5z" />
+      <path d="M15 7v2a4 4 0 01-4 4H9.828l-1.766 1.767c.28.149.599.233.938.233h2l3 3v-3h2a2 2 0 002-2V9a2 2 0 00-2-2h-1z" />
+    </svg>
+  </div>
+);
+
+const UserAvatar = () => (
+  <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-black">
+    <svg className="h-5 w-5 text-white" fill="currentColor" viewBox="0 0 20 20">
+      <path
+        fillRule="evenodd"
+        d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"
+        clipRule="evenodd"
+      />
+    </svg>
+  </div>
+);
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [sessionId, setSessionId] = useState('');
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const [currentResponse, setCurrentResponse] = useState('');
-
   /**
-   * Session ID
-   *
-   * RetrieveAndGenerate issues its own session IDs and uses them to hold
-   * conversation history server-side. A browser-invented ID is rejected, so
-   * this stays empty until the first response comes back with one.
+   * RetrieveAndGenerate issues its own session IDs and keeps conversation
+   * history server-side. A browser-invented ID is rejected, so this stays empty
+   * until the first response supplies one.
    */
+  const [sessionId, setSessionId] = useState('');
+  const [streamingText, setStreamingText] = useState('');
+  const [streamingCitations, setStreamingCitations] = useState<Citation[]>([]);
+  const [apiUnreachable, setApiUnreachable] = useState<string | null>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, currentResponse]);
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, streamingText]);
 
-  const sendMessage = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isLoading) return;
+  const sendMessage = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      const question = input.trim();
+      if (!question || isLoading) return;
 
-    const userMessage: Message = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: input,
-      timestamp: new Date(),
-    };
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `user-${Date.now()}`,
+          role: 'user',
+          content: question,
+          timestamp: new Date(),
+        },
+      ]);
+      setInput('');
+      setIsLoading(true);
+      setStreamingText('');
+      setStreamingCitations([]);
+      setApiUnreachable(null);
 
-    setMessages((prev) => [...prev, userMessage]);
-    setInput('');
-    setIsLoading(true);
-    setCurrentResponse('');
-
-    try {
-      // Get API endpoint from config.json (injected during deployment)
-      let apiEndpoint: string | null = null;
+      // Accumulated locally as well as in state: the final message is built
+      // from these, and state updates are batched so they can't be read back
+      // synchronously at the end of the stream.
+      let text = '';
+      const citations: Citation[] = [];
+      let streamError: string | null = null;
 
       try {
-        const configResponse = await fetch('/config.json');
-        if (configResponse.ok) {
-          const config = await configResponse.json();
-          apiEndpoint = config.apiEndpoint;
+        const response = await fetch(CHAT_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: question,
+            // Omitted on the first request of a conversation.
+            ...(sessionId ? { sessionId } : {}),
+          }),
+        });
+
+        if (!response.ok || !response.body) {
+          setApiUnreachable(`HTTP ${response.status} from ${CHAT_ENDPOINT}`);
+          setIsLoading(false);
+          return;
         }
-      } catch (e) {
-        console.log('Config not found - app needs to be deployed');
+
+        /**
+         * Parse NDJSON as it arrives.
+         *
+         * Chunk boundaries fall wherever the network puts them, not on line
+         * breaks, so the trailing partial line is held in `buffer` until the
+         * rest of it turns up.
+         */
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+
+            let event: StreamEvent;
+            try {
+              event = JSON.parse(line) as StreamEvent;
+            } catch {
+              continue; // Ignore anything that isn't a complete JSON object.
+            }
+
+            switch (event.type) {
+              case 'session':
+                setSessionId(event.sessionId);
+                break;
+              case 'text':
+                text += event.delta;
+                setStreamingText(text);
+                break;
+              case 'citation':
+                citations.push(event.citation);
+                setStreamingCitations([...citations]);
+                break;
+              case 'error':
+                streamError = event.message;
+                break;
+              case 'done':
+                break;
+            }
+          }
+        }
+      } catch (error) {
+        streamError =
+          error instanceof Error ? error.message : 'Could not reach the chat API.';
       }
 
-      // If no config.json, show helpful error
-      if (!apiEndpoint) {
-        throw new Error('Application not deployed. Please deploy the stack with: ./deploy.sh');
-      }
-
-      /**
-       * Remove trailing slash from API endpoint to avoid double slashes
-       *
-       * AWS API Gateway URLs end with a trailing slash (e.g., "/prod/")
-       * If we append "/chat" directly, we get "/prod//chat" which fails with CORS errors.
-       *
-       * This normalizes the endpoint by removing any trailing slash before
-       * appending the path, resulting in the correct URL: "/prod/chat"
-       */
-      const cleanEndpoint = apiEndpoint.endsWith('/') ? apiEndpoint.slice(0, -1) : apiEndpoint;
-
-      const response = await fetch(`${cleanEndpoint}/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `assistant-${Date.now()}`,
+          role: 'assistant',
+          content: streamError
+            ? `Sorry - something went wrong.\n\n\`${streamError}\``
+            : text,
+          citations: citations.length > 0 ? citations : undefined,
+          timestamp: new Date(),
         },
-        body: JSON.stringify({
-          message: input,
-          // Omitted on the first request of a conversation.
-          ...(sessionId ? { sessionId } : {}),
-        }),
-      });
+      ]);
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Failed to get response');
-      }
-
-      // API Gateway Lambda returns: { response: string, citations: [], sessionId: string }
-      const data = await response.json();
-
-      // Simulate typing effect for better UX
-      const fullResponse = data.response || '';
-      const citations = data.citations?.map((c: any) => c.uri) || [];
-
-      // Thread the next question onto the same conversation.
-      if (data.sessionId) {
-        setSessionId(data.sessionId);
-      }
-
-      // Animate the response character by character
-      for (let i = 0; i <= fullResponse.length; i++) {
-        setCurrentResponse(fullResponse.substring(0, i));
-        await new Promise(resolve => setTimeout(resolve, 10)); // 10ms per character
-      }
-
-      // Add final message
-      const assistantMessage: Message = {
-        id: `assistant-${Date.now()}`,
-        role: 'assistant',
-        content: fullResponse,
-        citations,
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, assistantMessage]);
-      setCurrentResponse('');
-    } catch (error) {
-      console.error('Error:', error);
-      const errorMessage: Message = {
-        id: `error-${Date.now()}`,
-        role: 'assistant',
-        content: 'Sorry, I encountered an error. Please try again.',
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
-    } finally {
+      setStreamingText('');
+      setStreamingCitations([]);
       setIsLoading(false);
-    }
-  };
-
-  const sampleQuestions = [
-    'What is the target net income for 2025?',
-    'How many PTO days do employees get per year?',
-    'What are the top 5 strategic priorities for 2025?',
-    'What was our Q4 2024 revenue and how did it compare to the target?',
-  ];
+    },
+    [input, isLoading, sessionId]
+  );
 
   return (
-    <div className="flex flex-col h-screen bg-white">
+    <div className="flex h-screen flex-col bg-white">
       {/* Header */}
-      <header className="bg-black border-b border-gray-300 px-6 py-4">
-        <div className="max-w-4xl mx-auto">
-          <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-2xl font-bold text-white">
-                RAG Agent Chat
-              </h1>
-              <p className="text-sm text-gray-400 mt-1">
-                Powered by Amazon Bedrock Agents & S3 Vectors
-              </p>
-            </div>
-            <div className="flex items-center space-x-2">
-              <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-white text-black">
-                <span className="w-2 h-2 bg-black rounded-full mr-2 animate-pulse"></span>
-                Connected
-              </span>
-            </div>
+      <header className="border-b border-gray-300 bg-black px-6 py-4">
+        <div className="mx-auto flex max-w-4xl items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-white">RAG Chat</h1>
+            <p className="mt-1 text-sm text-gray-400">
+              Amazon Bedrock Knowledge Bases &amp; S3 Vectors
+            </p>
           </div>
+          <span className="inline-flex items-center rounded-full bg-white px-3 py-1 text-xs font-medium text-black">
+            <span
+              className={`mr-2 h-2 w-2 rounded-full bg-black ${
+                isLoading ? 'animate-pulse' : ''
+              }`}
+            />
+            {isLoading ? 'Streaming' : 'Ready'}
+          </span>
         </div>
       </header>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-6 bg-white">
-        <div className="max-w-4xl mx-auto space-y-6">
-          {messages.length === 0 && (
-            <div className="text-center py-12">
-              <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gray-100 mb-4">
+      <div className="flex-1 overflow-y-auto bg-white px-4 py-6">
+        <div className="mx-auto max-w-4xl space-y-6">
+          {apiUnreachable && <MisconfiguredBanner detail={apiUnreachable} />}
+
+          {messages.length === 0 && !apiUnreachable && (
+            <div className="py-12 text-center">
+              <div className="mb-4 inline-flex h-16 w-16 items-center justify-center rounded-full bg-gray-100">
                 <svg
-                  className="w-8 h-8 text-black"
+                  className="h-8 w-8 text-black"
                   fill="none"
                   stroke="currentColor"
                   viewBox="0 0 24 24"
@@ -191,23 +218,13 @@ export default function Home() {
                   />
                 </svg>
               </div>
-              <h2 className="text-xl font-semibold text-black mb-2">
-                Start a conversation
+              <h2 className="mb-2 text-xl font-semibold text-black">
+                Ask about the knowledge base
               </h2>
-              <p className="text-gray-600 mb-6">
-                Ask me anything about the RAG tutorial or your knowledge base
+              <p className="mb-6 text-gray-600">
+                Answers are generated from your documents, with citations.
               </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-2xl mx-auto">
-                {sampleQuestions.map((question, index) => (
-                  <button
-                    key={index}
-                    onClick={() => setInput(question)}
-                    className="px-4 py-3 text-left text-sm bg-white border border-gray-300 rounded-lg hover:border-black hover:shadow-md transition-all"
-                  >
-                    <span className="text-gray-700">{question}</span>
-                  </button>
-                ))}
-              </div>
+              <QuickStarters onSelect={setInput} />
             </div>
           )}
 
@@ -219,57 +236,26 @@ export default function Home() {
               }`}
             >
               <div
-                className={`flex gap-3 max-w-3xl ${
+                className={`flex max-w-3xl gap-3 ${
                   message.role === 'user' ? 'flex-row-reverse' : 'flex-row'
                 }`}
               >
-                {/* Avatar */}
-                <div
-                  className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center ${
-                    message.role === 'user'
-                      ? 'bg-black'
-                      : 'bg-gray-200'
-                  }`}
-                >
-                  {message.role === 'user' ? (
-                    <svg
-                      className="w-5 h-5 text-white"
-                      fill="currentColor"
-                      viewBox="0 0 20 20"
-                    >
-                      <path
-                        fillRule="evenodd"
-                        d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z"
-                        clipRule="evenodd"
-                      />
-                    </svg>
-                  ) : (
-                    <svg
-                      className="w-5 h-5 text-black"
-                      fill="currentColor"
-                      viewBox="0 0 20 20"
-                    >
-                      <path d="M2 5a2 2 0 012-2h7a2 2 0 012 2v4a2 2 0 01-2 2H9l-3 3v-3H4a2 2 0 01-2-2V5z" />
-                      <path d="M15 7v2a4 4 0 01-4 4H9.828l-1.766 1.767c.28.149.599.233.938.233h2l3 3v-3h2a2 2 0 002-2V9a2 2 0 00-2-2h-1z" />
-                    </svg>
-                  )}
-                </div>
+                {message.role === 'user' ? <UserAvatar /> : <AssistantAvatar />}
 
-                {/* Message content */}
                 <div
                   className={`flex flex-col gap-2 ${
                     message.role === 'user' ? 'items-end' : 'items-start'
                   }`}
                 >
                   <div
-                    className={`px-4 py-3 rounded-lg ${
+                    className={`rounded-lg px-4 py-3 ${
                       message.role === 'user'
                         ? 'bg-black text-white'
-                        : 'bg-white text-black border border-gray-300'
+                        : 'border border-gray-300 bg-white text-black'
                     }`}
                   >
                     {message.role === 'user' ? (
-                      <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+                      <p className="whitespace-pre-wrap text-sm">{message.content}</p>
                     ) : (
                       <div className="markdown prose prose-sm max-w-none prose-headings:text-black prose-p:text-gray-800 prose-strong:text-black prose-code:text-black">
                         <ReactMarkdown>{message.content}</ReactMarkdown>
@@ -277,23 +263,7 @@ export default function Home() {
                     )}
                   </div>
 
-                  {/* Citations */}
-                  {message.citations && message.citations.length > 0 && (
-                    <div className="flex flex-wrap gap-2 max-w-lg">
-                      {message.citations.map((citation, idx) => (
-                        <div
-                          key={idx}
-                          className="px-2 py-1 text-xs bg-gray-100 rounded border border-gray-300"
-                          title={citation}
-                        >
-                          <span className="text-gray-600">📄 </span>
-                          <span className="text-gray-700">
-                            {citation.split('/').pop()?.substring(0, 30)}...
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  {message.citations && <Citations citations={message.citations} />}
 
                   <span className="text-xs text-gray-500">
                     {message.timestamp.toLocaleTimeString()}
@@ -303,29 +273,29 @@ export default function Home() {
             </div>
           ))}
 
-          {/* Streaming response */}
-          {currentResponse && (
+          {/* In-flight response - real tokens, arriving as the model writes them */}
+          {(isLoading || streamingText) && (
             <div className="flex justify-start">
-              <div className="flex gap-3 max-w-3xl">
-                <div className="flex-shrink-0 w-8 h-8 rounded-full bg-gray-200 flex items-center justify-center">
-                  <svg
-                    className="w-5 h-5 text-black"
-                    fill="currentColor"
-                    viewBox="0 0 20 20"
-                  >
-                    <path d="M2 5a2 2 0 012-2h7a2 2 0 012 2v4a2 2 0 01-2 2H9l-3 3v-3H4a2 2 0 01-2-2V5z" />
-                    <path d="M15 7v2a4 4 0 01-4 4H9.828l-1.766 1.767c.28.149.599.233.938.233h2l3 3v-3h2a2 2 0 002-2V9a2 2 0 00-2-2h-1z" />
-                  </svg>
-                </div>
-                <div className="px-4 py-3 rounded-lg bg-white border border-gray-300">
-                  <div className="markdown prose prose-sm max-w-none prose-headings:text-black prose-p:text-gray-800 prose-strong:text-black prose-code:text-black">
-                    <ReactMarkdown>{currentResponse}</ReactMarkdown>
+              <div className="flex max-w-3xl gap-3">
+                <AssistantAvatar />
+                <div className="flex flex-col gap-2">
+                  <div className="rounded-lg border border-gray-300 bg-white px-4 py-3">
+                    {streamingText ? (
+                      <div className="markdown prose prose-sm max-w-none prose-headings:text-black prose-p:text-gray-800 prose-strong:text-black prose-code:text-black">
+                        <ReactMarkdown>{streamingText}</ReactMarkdown>
+                      </div>
+                    ) : (
+                      <span className="text-sm text-gray-500">Searching documents…</span>
+                    )}
+                    <div className="mt-2 flex gap-1">
+                      <div className="typing-dot h-2 w-2 rounded-full bg-gray-400" />
+                      <div className="typing-dot h-2 w-2 rounded-full bg-gray-400" />
+                      <div className="typing-dot h-2 w-2 rounded-full bg-gray-400" />
+                    </div>
                   </div>
-                  <div className="flex gap-1 mt-2">
-                    <div className="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
-                    <div className="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
-                    <div className="w-2 h-2 bg-gray-400 rounded-full typing-dot"></div>
-                  </div>
+                  {streamingCitations.length > 0 && (
+                    <Citations citations={streamingCitations} />
+                  )}
                 </div>
               </div>
             </div>
@@ -337,29 +307,24 @@ export default function Home() {
 
       {/* Input */}
       <div className="border-t border-gray-300 bg-white px-4 py-4">
-        <div className="max-w-4xl mx-auto">
+        <div className="mx-auto max-w-4xl">
           <form onSubmit={sendMessage} className="flex gap-3">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask me anything..."
+              placeholder="Ask me anything…"
               disabled={isLoading}
-              className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-black focus:border-transparent bg-white text-black placeholder-gray-500 disabled:opacity-50"
+              className="flex-1 rounded-lg border border-gray-300 bg-white px-4 py-3 text-black placeholder-gray-500 focus:border-transparent focus:outline-none focus:ring-2 focus:ring-black disabled:opacity-50"
             />
             <button
               type="submit"
               disabled={isLoading || !input.trim()}
-              className="px-6 py-3 bg-black hover:bg-gray-800 disabled:bg-gray-400 text-white font-medium rounded-lg transition-colors disabled:cursor-not-allowed flex items-center gap-2"
+              className="flex items-center gap-2 rounded-lg bg-black px-6 py-3 font-medium text-white transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:bg-gray-400"
             >
               {isLoading ? (
                 <>
-                  <svg
-                    className="animate-spin h-5 w-5"
-                    xmlns="http://www.w3.org/2000/svg"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                  >
+                  <svg className="h-5 w-5 animate-spin" fill="none" viewBox="0 0 24 24">
                     <circle
                       className="opacity-25"
                       cx="12"
@@ -374,12 +339,12 @@ export default function Home() {
                       d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                     />
                   </svg>
-                  <span>Thinking...</span>
+                  <span>Streaming…</span>
                 </>
               ) : (
                 <>
                   <svg
-                    className="w-5 h-5"
+                    className="h-5 w-5"
                     fill="none"
                     stroke="currentColor"
                     viewBox="0 0 24 24"
@@ -396,8 +361,8 @@ export default function Home() {
               )}
             </button>
           </form>
-          <p className="text-xs text-gray-500 mt-2 text-center">
-            Session ID: {sessionId || 'not started'}
+          <p className="mt-2 text-center text-xs text-gray-500">
+            Session: {sessionId ? `${sessionId.slice(0, 8)}…` : 'not started'}
           </p>
         </div>
       </div>

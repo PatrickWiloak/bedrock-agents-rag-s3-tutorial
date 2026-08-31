@@ -141,19 +141,35 @@ vectorSearchConfiguration: {
 
 Support depends on the vector store, and not every store implements it. Check current S3 Vectors capability before depending on it; if it isn't available and exact-match retrieval matters to you, that is a legitimate reason to choose OpenSearch Serverless despite the cost.
 
-## Streaming responses
+## Streaming: how it actually works here
 
-`RetrieveAndGenerate` returns a complete answer. For token-by-token output there is `RetrieveAndGenerateStream`.
+Answers stream token by token. That was not true of earlier versions of this tutorial, which faked it by animating an already-complete response, so it is worth stating what makes it real.
 
-The current UI fakes it: the Lambda returns the whole answer and `web/app/page.tsx` animates it character by character. That's honest enough for a tutorial and much simpler, but it means time-to-first-character equals total generation time.
+**The transport.** A Lambda Function URL with `invokeMode: RESPONSE_STREAM`, fronted by CloudFront at `/api/*`. API Gateway cannot do this - its Lambda proxy integration buffers the whole response before returning it.
 
-Real streaming through this architecture requires replacing API Gateway REST + Lambda proxy integration, which buffers the entire response. Options:
+**The handler.** `awslambda.streamifyResponse`, a global the Node runtime injects when the Function URL is configured for streaming:
 
-- **Lambda function URL** with `RESPONSE_STREAM` invoke mode
-- **API Gateway WebSocket API**
-- **AppSync** subscriptions
+```js
+export const handler = awslambda.streamifyResponse(async (event, responseStream) => {
+  const stream = awslambda.HttpResponseStream.from(responseStream, {
+    statusCode: 200,
+    headers: { 'Content-Type': 'application/x-ndjson' },
+  });
+  // write NDJSON lines, then stream.end()
+});
+```
 
-Each is a meaningful rearchitecture of [lib/web-hosting-construct.ts](../lib/web-hosting-construct.ts), which is why the tutorial doesn't do it.
+**The protocol.** NDJSON - one JSON object per line: `session`, `text`, `citation`, `done`, `error`. Newline framing needs no library at either end and makes partial lines trivially detectable.
+
+**The trap.** CloudFront `compress` must be `false` on the streaming behaviour. With compression on, everything still works - it just silently stops streaming.
+
+Full detail in [chapter 07](07-web-interface.md) and [ARCHITECTURE.md](../ARCHITECTURE.md#the-wire-protocol).
+
+### Where you would go further
+
+- **Server-Sent Events** instead of raw NDJSON, if you want browser `EventSource` semantics and automatic reconnection. NDJSON over `fetch` was chosen here because it needs no special content negotiation and reads more plainly.
+- **WebSockets**, if you need the client to interrupt or send mid-generation signals. That is a genuinely different architecture - API Gateway WebSocket API or AppSync - and overkill for question answering.
+- **Backpressure**, if generation can outrun the client. For chat-sized responses it cannot.
 
 ## Multi-modal documents
 
@@ -201,7 +217,7 @@ Before reaching for one, though: if your use case is "answer questions about my 
 - **Multiple knowledge bases** buy access-control and ingestion isolation, at the cost of duplicated infrastructure
 - **Metadata filtering** must be applied server-side when it's doing security work
 - **Reranking and hybrid search** improve retrieval precision for specific corpus shapes
-- **True streaming** needs a different API surface than REST + Lambda proxy
+- **Streaming** is real here, and it is the Function URL plus `compress: false` that makes it so
 - **AgentCore** is where to go if you need tools and orchestration - and it reuses this knowledge base
 
 ## Resources
@@ -214,4 +230,4 @@ Before reaching for one, though: if your use case is "answer questions about my 
 
 ## Next steps
 
-→ **[Step 7: The Web Interface](07-web-interface.md)** - how the UI, API Gateway, and Lambda fit together.
+→ **[Step 7: The Web Interface](07-web-interface.md)** - how the UI, CloudFront, and the streaming Lambda fit together.
